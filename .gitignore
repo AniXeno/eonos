@@ -1,0 +1,28 @@
+# Rust / Cargo Outputs
+/target/
+**/*.rs.bk
+
+# Bootable Images & Archive Artifacts
+*.iso
+*.img
+*.bin
+*.elf
+*.zip
+*.tar
+*.gz
+*.7z
+
+# Intermediate Build Folders (QEMU, Limine, GRUB)
+/isodir/
+/build/
+/dist/
+
+# OS / System Temporary Files
+.DS_Store
+Thumbs.db
+
+# Editor & Tooling Configs
+.vscode/
+.idea/
+*.swp
+*.swo
