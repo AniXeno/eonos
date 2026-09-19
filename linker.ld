@@ -17,12 +17,19 @@ SECTIONS
        the kernel code model and be mapped alongside a higher-half direct map. */
     . = 0xffffffff80000000;
 
+    /* Section-boundary symbols the VMM uses to map the kernel image with
+       per-section permissions (text RX, rodata RO, data/bss RW, all NX
+       except text). Addresses here are link-time *virtual* addresses;
+       the VMM turns them into physical ones via KernelAddressRequest. */
+    PROVIDE(__kernel_text_start = .);
     .text : {
         *(.text .text.*)
     } :text
+    PROVIDE(__kernel_text_end = .);
 
     . += CONSTANT(MAXPAGESIZE);
 
+    PROVIDE(__kernel_rodata_start = .);
     .rodata : {
         *(.rodata .rodata.*)
 
@@ -34,9 +41,11 @@ SECTIONS
         . = ALIGN(8);
         KEEP(*(.requests_end_marker))
     } :rodata
+    PROVIDE(__kernel_rodata_end = .);
 
     . += CONSTANT(MAXPAGESIZE);
 
+    PROVIDE(__kernel_data_start = .);
     .data : {
         *(.data .data.*)
     } :data
@@ -49,6 +58,7 @@ SECTIONS
         *(COMMON)
         *(.bss .bss.*)
     } :data
+    PROVIDE(__kernel_data_end = .);
 
     /DISCARD/ : {
         *(.eh_frame)
