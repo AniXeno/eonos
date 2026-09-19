@@ -1,124 +1,181 @@
 # EonOS
 
-A hobby x86_64 operating system kernel written in Rust, booted via
-[Limine](https://limine-bootloader.org/).
+[![Language: Rust](https://img.shields.io/badge/Language-Rust-orange.svg)](https://www.rust-lang.org/)
+[![Bootloader: Limine](https://img.shields.io/badge/Bootloader-Limine-blue.svg)](https://limine-bootloader.org/)
+[![Architecture: x86_64](https://img.shields.io/badge/Architecture-x86__64-lightgrey.svg)]()
+
+A custom x86_64 hobby operating system kernel written in Rust and booted using the Limine boot protocol.
+
+EonOS is built from the ground up as an experimental modern operating system project. The main goal is to explore low level systems programming, kernel architecture, memory management, hardware interaction, and the fundamentals required to build an operating system.
+
+The project is still in early development and is primarily intended for learning, experimentation, and eventually building a more complete standalone operating system.
+
+---
+
+## Features
+
+Currently implemented:
+
+- x86_64 kernel
+- Limine boot protocol support
+- Rust based kernel
+- Framebuffer initialization
+- Basic framebuffer pixel read/write testing
+- Kernel initialization and logging
+- Bootable ISO generation
+- QEMU support for testing
+
+More kernel functionality will be added as development continues.
+
+---
+
+## Project Goals
+
+Some of the longer term goals for EonOS include:
+
+- Physical and virtual memory management
+- Interrupt handling
+- CPU and architecture abstractions
+- Process and thread management
+- A proper scheduler
+- User mode applications
+- System calls
+- Filesystem support
+- Device drivers
+- Networking
+- A shell and basic userspace utilities
+- Better hardware support
+- A more complete userspace environment
+
+The architecture may change significantly as the kernel grows.
+
+---
 
 ## Prerequisites
 
-You already have these (confirmed via your terminal output):
+Ensure you have the following tools installed before building:
 
-- `rustc`/`cargo` (nightly toolchain — pinned in `rust-toolchain.toml`)
-- `clang` / `ld.lld`
-- `nasm`
-- `qemu-system-x86_64`
-- `gdb`
-- `xorriso`, `mtools`, `edk2-ovmf` (installed via pacman)
+- **Rust toolchain** with the `nightly` toolchain for bare metal development
+- **QEMU** with `qemu-system-x86_64`
+- **Xorriso** for ISO creation
+- **mtools** for filesystem image manipulation
 
-Make sure the nightly `rust-src` and `llvm-tools-preview` components are
-present (rustup will pull these automatically the first time you build,
-thanks to `rust-toolchain.toml`):
+A Linux development environment is currently recommended.
 
-```sh
-rustup component add rust-src llvm-tools-preview --toolchain nightly
-```
+---
 
 ## Building
 
+Run the automated build script to compile the kernel and produce a bootable ISO.
+
+### Debug build
+
 ```sh
-./build.sh          # debug build -> eonos.iso
-./build.sh release  # release build -> eonos.iso
+./build.sh
 ```
 
-The first run clones and builds Limine's binary branch into `limine/`
-(cached afterwards — delete the folder to force a re-fetch/update).
+This produces:
+
+```text
+eonos.iso
+```
+
+### Release build
+
+```sh
+./build.sh release
+```
+
+The resulting ISO can then be booted using QEMU or written to suitable boot media for testing.
+
+---
 
 ## Running
 
+The included run script launches EonOS using QEMU:
+
 ```sh
-./run.sh            # BIOS boot via QEMU, serial log printed to your terminal
-UEFI=1 ./run.sh      # UEFI boot via OVMF instead
+./runb.sh
 ```
 
-You should see something like:
+You should see output similar to:
 
-```
+```text
 Kernel:Init > EonOS booting via Limine | OK
 Framebuffer:Init > Framebuffer Initialized (1024x768 @ 32bpp) | OK
 Framebuffer:SelfTest > Pixel read/write verified | OK
 Kernel:Init > Initialization complete, halting | OK
 ```
 
-## Logging system
+The current kernel performs its initialization sequence and then halts. As more kernel subsystems are implemented, this behavior will gradually be replaced by an actual kernel runtime environment.
 
-Every subsystem logs through the macros in `src/logger.rs`, using the format:
+---
 
-```
-Module:Function > Output | STATUS
-```
+## Architecture
 
-- **Module** — subsystem name (`PMM`, `VMM`, `Memory`, `Framebuffer`, `GDT`, `IDT`, ...)
-- **Function** — what it was doing (`Init`, `SelfTest`, ...)
-- **Output** — free-form message, `format_args!`-style
-- **Status** — `OK`, `BUSY`, `FAIL`, `CRITICAL`, `DEBUG`
+EonOS currently targets **x86_64** systems.
 
-Macros available: `log_ok!`, `log_busy!`, `log_fail!`, `log_critical!`, `log_debug!`.
+The kernel is designed around a small and modular architecture so that individual subsystems can be developed and tested independently. Rust provides memory safety and strong type guarantees while still allowing the low level control required for kernel development.
 
-```rust
-log_ok!("PMM", "Init", "Mapped {} pages", page_count);
-// -> PMM:Init > Mapped 4096 pages | OK
-```
+The current boot process is handled by **Limine**, which provides the kernel with information such as the framebuffer and boot environment before transferring control to EonOS.
 
-Output currently goes to the COM1 serial port (`-serial stdio` in QEMU), with
-ANSI colors per status level. A framebuffer text console can be layered on
-top later using the same `Logger` sink.
+---
 
-## Console font & colours
+## Development
 
-The screen console renders glyphs from a **PSF1/PSF2 bitmap font** embedded at
-build time from `font.psf` (project root). Any size works (8x16, 10x18, 16x32...).
-To change the look, replace `font.psf` with an **uncompressed** PSF and rebuild:
+EonOS is currently a hobby and educational project. Expect breaking changes, unfinished subsystems, experimental implementations, and occasional completely broken builds.
 
-```sh
-ls /usr/share/kbd/consolefonts/                                  # fonts on your system
-gunzip -c /usr/share/kbd/consolefonts/ter-v16n.psf.gz > font.psf  # e.g. Terminus 8x16
-./build.sh && ./run.sh
-```
+Development is currently focused on establishing the fundamental kernel infrastructure before moving into more advanced functionality.
 
-The bundled `font.psf` was generated from GNU Unifont with `tools/make_psf.py`
-(`make_psf.py FONT.otf OUT.psf [height] [width] [baseline]`).
-Glyph N is expected to be codepoint N (true for ASCII in all common PSFs).
+Some planned areas include:
 
-Colour is done with ANSI SGR escapes (`ESC[31m`, `ESC[92m`, `ESC[38;2;R;G;Bm`,
-`ESC[0m`...), understood by both the serial port and the framebuffer console.
-The 16-colour palette lives in `PALETTE` at the top of `src/console.rs`.
+```text
+Boot
+ ├── Limine
+ └── Kernel entry
 
-## Project layout
+CPU
+ ├── GDT
+ ├── IDT
+ └── Interrupts
 
-```
-src/
-  main.rs         kernel entry point (_start), Limine requests, panic handler
-  logger.rs       Module:Function > Output | Status logging system
-  serial.rs       16550 UART driver (log sink)
-  framebuffer.rs  Limine framebuffer request + init/self-test
-  console.rs      framebuffer text console (PSF font, ANSI colours)
-font.psf          console font (PSF2)
-tools/make_psf.py TTF/OTF -> PSF2 converter
-linker.ld         higher-half kernel linker script
-x86_64-eonos.json custom Rust target spec (freestanding, no SSE, kernel code model)
-limine.conf       Limine boot menu config
-build.sh          builds kernel + fetches Limine + makes eonos.iso
-run.sh            boots eonos.iso in QEMU
+Memory
+ ├── Physical memory
+ ├── Paging
+ └── Heap allocation
+
+Kernel
+ ├── Scheduler
+ ├── Processes
+ ├── Threads
+ └── Syscalls
+
+Userspace
+ ├── Shell
+ ├── Utilities
+ └── Applications
+
+Hardware
+ ├── Storage
+ ├── Input
+ ├── Display
+ └── Networking
 ```
 
-## Roadmap
+---
 
-Next subsystems to bring up, in the order that tends to work best:
+## AI Disclosure
 
-1. **GDT** — flat 64-bit segments + TSS (needed before IDT for the double-fault IST)
-2. **IDT** — exception handlers, then hardware interrupts (PIC/APIC)
-3. **PMM** — physical memory manager, using Limine's memory map request
-4. **VMM** — page tables / virtual memory manager, building on Limine's HHDM
-5. **Memory** — kernel heap allocator (`#[global_allocator]`) on top of VMM
+This project is developed with AI assistance for **partial code generation, debugging, documentation, research, and architectural advice**.
 
-Each should log through `log_ok!`/`log_fail!`/etc. exactly like `Framebuffer`
-does now, e.g. `PMM:Init > Mapped 4096 pages | OK`.
+AI generated code is reviewed, modified, tested, and integrated manually as part of the development process. AI assistance does not replace the project's own design decisions or testing.
+
+---
+
+## Status
+
+**EonOS is currently experimental and under active development.**
+
+The project is not intended to replace an existing operating system yet. At its current stage, it is primarily a learning project focused on understanding how modern operating systems work internally.
+
+More functionality will be added as the kernel develops.
