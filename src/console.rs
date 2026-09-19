@@ -184,6 +184,11 @@ impl Console {
         }
     }
 
+    /// Console width in character cells.
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
     pub fn clear(&mut self) {
         let bg = self.bg;
         self.fill_rect(0, 0, self.width, self.height, bg);

@@ -6,9 +6,12 @@ pub mod framebuffer;
 pub mod gdt;
 pub mod idt;
 pub mod logger;
+pub mod panic_screen;
 pub mod pmm;
 pub mod serial;
+pub mod vmm;
 
+use core::fmt::Write;
 use core::panic::PanicInfo;
 use limine::BaseRevision;
 
@@ -50,7 +53,12 @@ unsafe extern "C" fn _start() -> ! {
     pmm::init();
     pmm::self_test();
 
-    // TODO: VMM, MEMORY subsystems go here.
+    vmm::init();
+    vmm::self_test();
+
+    // TODO: heap allocator, then scheduler/processes go here.
+    // NOTE: pmm::reclaim_bootloader_memory() must stay uncalled until the
+    // kernel also runs on its own stack, not just its own page tables.
 
     log_ok!("Kernel", "Init", "Initialization complete, halting");
 
@@ -68,5 +76,9 @@ fn hcf() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     log_critical!("Kernel", "Panic", "{}", info);
-    hcf();
+    panic_screen::show("KERNEL PANIC", (90, 0, 110), |w| {
+        let _ = writeln!(w, "{}", info);
+        let _ = writeln!(w);
+        let _ = writeln!(w, "Full details are on the serial log.");
+    });
 }

@@ -376,6 +376,18 @@ pub fn usable_frame_count() -> usize {
     PMM.lock().as_ref().map(|p| p.usable_frames).unwrap_or(0)
 }
 
+/// Highest physical address the PMM knows about (i.e. the exclusive end of
+/// the frame bitmap). The VMM direct-maps physical memory up to this
+/// address, so it covers usable RAM *and* still-reclaimable bootloader
+/// memory, but not MMIO regions like the framebuffer, which live elsewhere
+/// and are mapped separately.
+pub fn phys_top() -> u64 {
+    PMM.lock()
+        .as_ref()
+        .map(|p| p.total_frames as u64 * PAGE_SIZE)
+        .unwrap_or(0)
+}
+
 /// Hand Limine's bootloader-reclaimable memory to the allocator.
 ///
 /// # Safety

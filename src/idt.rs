@@ -8,6 +8,7 @@
 //! Fatal exceptions print a full register dump to the screen and serial port
 //! and halt. #BP (int3) is handled and returns, which makes a handy self-test.
 
+use core::fmt::Write;
 use core::ptr::{addr_of, addr_of_mut};
 
 use crate::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
@@ -309,11 +310,7 @@ fn read_cr3() -> u64 {
 fn fatal(frame: &InterruptFrame) -> ! {
     // The fault may have happened while one of these locks was held (e.g. in
     // the middle of a log call). We're never returning, so break them open.
-    unsafe {
-        crate::logger::LOGGER.force_unlock();
-        crate::serial::SERIAL1.force_unlock();
-        crate::console::CONSOLE.force_unlock();
-    }
+    crate::panic_screen::force_unlock_all();
 
     let name = EXCEPTION_NAMES
         .get(frame.vector as usize)
@@ -395,5 +392,30 @@ fn fatal(frame: &InterruptFrame) -> ! {
         frame.r15
     );
 
-    crate::hcf()
+    // Full register dump above already went to serial (and the console, if
+    // it was up); this is the clean summary left on screen when we halt.
+    let vector = frame.vector;
+    let error_code = frame.error_code;
+    let rip = frame.rip;
+    let rsp = frame.rsp;
+    crate::panic_screen::show("KERNEL EXCEPTION", (130, 0, 0), |w| {
+        let _ = writeln!(w, "{}", name);
+        let _ = writeln!(w, "vector {}   error code {:#x}", vector, error_code);
+        if vector == 14 {
+            let cr2 = read_cr2();
+            let _ = writeln!(w, "faulting address {:#018x}", cr2);
+            if let Some(phys) = crate::vmm::translate(cr2) {
+                let _ = writeln!(
+                    w,
+                    "(that address is mapped to phys {:#018x} -- likely a permission violation)",
+                    phys
+                );
+            }
+        }
+        let _ = writeln!(w);
+        let _ = writeln!(w, "RIP {:#018x}", rip);
+        let _ = writeln!(w, "RSP {:#018x}", rsp);
+        let _ = writeln!(w);
+        let _ = writeln!(w, "Full register dump is on the serial log.");
+    });
 }
