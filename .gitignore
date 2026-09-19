@@ -24,5 +24,6 @@ Thumbs.db
 # Editor & Tooling Configs
 .vscode/
 .idea/
+limine/
 *.swp
 *.swo
