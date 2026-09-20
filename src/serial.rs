@@ -36,6 +36,21 @@ impl SerialPort {
         }
         unsafe { outb(self.port, byte) };
     }
+
+    /// Non-blocking: `Some(byte)` if the receiver has one waiting
+    /// (LSR bit 0, "data ready"), `None` otherwise. This is the only
+    /// input device EonOS has until a real keyboard driver (PS/2 or
+    /// USB HID) exists -- in QEMU it's whatever is hooked up to COM1
+    /// (usually the host terminal via `-serial stdio`).
+    pub fn try_read_byte(&mut self) -> Option<u8> {
+        unsafe {
+            if inb(self.port + 5) & 0x01 != 0 {
+                Some(inb(self.port))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 impl fmt::Write for SerialPort {

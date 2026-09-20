@@ -723,6 +723,73 @@ pub fn copy_from_user(dst: &mut [u8], src: u64) -> bool {
     true
 }
 
+/// Copy `src` into the *current* address space's user memory at `dst`.
+/// Returns `false` (leaving the destination partly written) if any part
+/// of the range is outside user space or not mapped user-writable.
+///
+/// Mirror image of `copy_from_user`: same software page-table walk
+/// through the direct map, so a bad or read-only pointer from a process
+/// is a clean `false` here instead of a kernel-mode page fault.
+pub fn copy_to_user(dst: u64, src: &[u8]) -> bool {
+    if src.is_empty() {
+        return true;
+    }
+    let Some(end) = dst.checked_add(src.len() as u64) else {
+        return false;
+    };
+    if end > USER_SPACE_END {
+        return false;
+    }
+
+    let pml4 = current_cr3();
+    let mut done = 0usize;
+    while done < src.len() {
+        let va = dst + done as u64;
+        let page_off = (va & (PAGE_SIZE - 1)) as usize;
+        let n = (src.len() - done).min(PAGE_SIZE as usize - page_off);
+        let Some(phys) = (unsafe { walk_user_write(pml4, va) }) else {
+            return false;
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(done),
+                pmm::phys_to_virt(phys) as *mut u8,
+                n,
+            );
+        }
+        done += n;
+    }
+    true
+}
+
+/// Software walk for a ring-3 write of `virt` through `pml4_phys`.
+/// Same as `walk_user`, but also demands the `WRITABLE` bit at the leaf
+/// -- writing through a read-only user mapping should fail cleanly, not
+/// silently succeed.
+unsafe fn walk_user_write(pml4_phys: u64, virt: u64) -> Option<u64> {
+    let pml4 = table_ptr(pml4_phys);
+    let e = (*pml4).0[index(virt, 0)];
+    if e & (PRESENT | USER) != (PRESENT | USER) {
+        return None;
+    }
+    let pdpt = table_ptr(e & ADDR_MASK);
+    let e = (*pdpt).0[index(virt, 1)];
+    if e & (PRESENT | USER) != (PRESENT | USER) || e & HUGE != 0 {
+        return None;
+    }
+    let pd = table_ptr(e & ADDR_MASK);
+    let e = (*pd).0[index(virt, 2)];
+    if e & (PRESENT | USER) != (PRESENT | USER) || e & HUGE != 0 {
+        return None;
+    }
+    let pt = table_ptr(e & ADDR_MASK);
+    let leaf = (*pt).0[index(virt, 3)];
+    if leaf & (PRESENT | USER | WRITABLE) != (PRESENT | USER | WRITABLE) {
+        return None;
+    }
+    Some((leaf & ADDR_MASK) + (virt & (PAGE_SIZE - 1)))
+}
+
 /// Create a new address space for a process: a private, empty lower
 /// half plus the kernel's upper half, shared as described on
 /// `AddressSpace`. Returns `None` if the kernel VMM isn't initialized

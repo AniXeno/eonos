@@ -30,7 +30,7 @@
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::{gdt, pit, pmm, process, scheduler, vmm};
+use crate::{gdt, pit, pmm, process, scheduler, sync, vmm};
 use crate::{log_debug, log_fail, log_ok};
 
 const MSR_EFER: u32 = 0xC000_0080;
@@ -209,14 +209,27 @@ pub fn init() {
 }
 
 // System call numbers (Linux x86-64 numbering for the ones Linux has).
+pub const SYS_READ: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_SCHED_YIELD: u64 = 24;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_EXIT: u64 = 60;
 
+// EonOS-specific calls, well clear of Linux's own numbers, standing in
+// for a real filesystem (open/read/close on the initramfs) until one
+// exists. `list_files` writes a newline-separated listing; `read_file`
+// looks a path up by name and copies its whole contents in one shot --
+// no offsets, no partial reads. Both are stopgaps for the shell's
+// `ls`/`cat` and are expected to go away once EonOS has real fds.
+pub const SYS_LIST_FILES: u64 = 9001;
+pub const SYS_READ_FILE: u64 = 9002;
+
 const EBADF: i64 = 9;
 const EFAULT: i64 = 14;
+const ENOENT: i64 = 2;
 const ENOSYS: i64 = 38;
+const ENAMETOOLONG: i64 = 36;
+const ERANGE: i64 = 34;
 
 /// Encode a positive errno as the negative value a syscall returns.
 const fn errno(e: i64) -> u64 {
@@ -238,6 +251,319 @@ fn console_write(bytes: &[u8]) {
     if let Some(console) = crate::console::CONSOLE.lock().as_mut() {
         let _ = console.write_str(&text);
     }
+}
+
+/// How many previous lines `read_line` remembers for up/down-arrow
+/// recall. Bounded so a long session doesn't grow this forever; old
+/// entries are dropped, same trade-off as the PS/2 driver's own ring
+/// buffer.
+const HISTORY_CAP: usize = 32;
+
+static HISTORY: sync::IrqMutex<alloc::collections::VecDeque<alloc::vec::Vec<u8>>> =
+    sync::IrqMutex::new(alloc::collections::VecDeque::new());
+
+/// Next raw input byte from whichever source has one, blocking
+/// (via yield, not a real wait queue) until one shows up. PS/2 and
+/// serial both just fill a byte queue from their own IRQ handlers, so
+/// polling either in turn is enough -- no reason to prefer one over
+/// the other beyond "whichever has something waiting first".
+fn next_byte() -> u8 {
+    loop {
+        if let Some(b) = crate::drivers::ps2::try_read_byte() {
+            return b;
+        }
+        if let Some(b) = crate::serial::SERIAL1.lock().try_read_byte() {
+            return b;
+        }
+        scheduler::yield_now();
+    }
+}
+
+/// Decode a `\x1b[...` escape sequence (as PS/2 arrow/nav keys are
+/// encoded into by `drivers::ps2::push_escape`, and as a real terminal
+/// emulator would send them over serial too) into one of a small fixed
+/// set of edit actions. Called right after the ESC byte itself is
+/// consumed. Reads (and blocks on) further bytes as needed -- safe
+/// because a `\x1b` this driver produces is always immediately followed
+/// by the rest of its sequence; a lone stray ESC from a real keyboard's
+/// Esc key will just stall until another byte arrives, same as it would
+/// on a real tty waiting to see if it's the start of a sequence.
+enum EditAction {
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    Delete,
+    Unknown,
+}
+
+fn decode_escape() -> EditAction {
+    if next_byte() != b'[' {
+        return EditAction::Unknown;
+    }
+    match next_byte() {
+        b'A' => EditAction::Up,
+        b'B' => EditAction::Down,
+        b'C' => EditAction::Right,
+        b'D' => EditAction::Left,
+        b'H' => EditAction::Home,
+        b'F' => EditAction::End,
+        b'3' => {
+            // Delete is "\x1b[3~" -- a three-byte final sequence rather
+            // than one letter, so it needs an extra byte consumed.
+            let _ = next_byte(); // expected '~'
+            EditAction::Delete
+        }
+        _ => EditAction::Unknown,
+    }
+}
+
+/// Erase the currently-displayed line on screen and replace both the
+/// buffer and the terminal display with `new_line`, cursor at the end.
+/// Used for history recall, where the whole line changes at once
+/// rather than one character at a time.
+fn replace_line(line: &mut alloc::vec::Vec<u8>, cursor: &mut usize, new_line: alloc::vec::Vec<u8>) {
+    for _ in 0..*cursor {
+        console_write(b"\x08");
+    }
+    for _ in 0..line.len() {
+        console_write(b" ");
+    }
+    for _ in 0..line.len() {
+        console_write(b"\x08");
+    }
+    console_write(&new_line);
+    *line = new_line;
+    *cursor = line.len();
+}
+
+/// Redraw the visible line from `from` (a byte index into `line`) to
+/// its end, then park the cursor back at `cursor`. Used whenever an
+/// edit touches anything before the end of the line -- a plain append
+/// or trailing backspace doesn't need this and stays on the cheaper
+/// path in `read_line` itself.
+fn redraw_tail(line: &[u8], from: usize, cursor: usize) {
+    console_write(&line[from..]);
+    console_write(b" "); // erase whatever character used to trail here
+    let to_move_back = line.len() - cursor + 1;
+    for _ in 0..to_move_back {
+        console_write(b"\x08");
+    }
+}
+
+/// Read one line of input for `sys_read(0, ...)`.
+///
+/// Input comes from either the PS/2 keyboard (`drivers::ps2`) or the
+/// serial port (COM1 -- in QEMU, typically `-serial stdio`, i.e. the
+/// host terminal); both are polled so either can drive the shell.
+/// This does canonical-mode editing in the kernel -- echoing bytes
+/// back, backspace/delete, left/right cursor movement, and up/down
+/// history recall via ANSI escape sequences -- the same job a real
+/// tty line discipline does, just smaller.
+///
+/// Polls rather than waiting on an IRQ: both input sources just fill a
+/// buffer in their own interrupt handlers, so a bare read-and-retry
+/// loop (yielding between attempts so it doesn't starve other threads)
+/// is the simplest way to consume either. Returns at most `max` bytes,
+/// including the trailing `\n`.
+fn read_line(max: usize) -> alloc::vec::Vec<u8> {
+    let mut line: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if max == 0 {
+        return line;
+    }
+    let mut cursor = 0usize; // byte index into `line`; can be < line.len()
+    let mut history_pos: Option<usize> = None; // index into HISTORY while recalling
+
+    loop {
+        let byte = next_byte();
+
+        match byte {
+            b'\r' | b'\n' => {
+                console_write(b"\n");
+                if line.len() < max {
+                    line.push(b'\n');
+                }
+                break;
+            }
+            0x1B => {
+                match decode_escape() {
+                    EditAction::Left => {
+                        if cursor > 0 {
+                            cursor -= 1;
+                            console_write(b"\x08");
+                        }
+                    }
+                    EditAction::Right => {
+                        if cursor < line.len() {
+                            console_write(&line[cursor..cursor + 1]);
+                            cursor += 1;
+                        }
+                    }
+                    EditAction::Home => {
+                        for _ in 0..cursor {
+                            console_write(b"\x08");
+                        }
+                        cursor = 0;
+                    }
+                    EditAction::End => {
+                        console_write(&line[cursor..]);
+                        cursor = line.len();
+                    }
+                    EditAction::Delete => {
+                        if cursor < line.len() {
+                            line.remove(cursor);
+                            redraw_tail(&line, cursor, cursor);
+                        }
+                    }
+                    EditAction::Up => {
+                        let history = HISTORY.lock();
+                        if history.is_empty() {
+                            continue;
+                        }
+                        let next_pos = match history_pos {
+                            None => history.len() - 1,
+                            Some(0) => 0,
+                            Some(p) => p - 1,
+                        };
+                        history_pos = Some(next_pos);
+                        let entry = history[next_pos].clone();
+                        drop(history);
+                        replace_line(&mut line, &mut cursor, entry);
+                    }
+                    EditAction::Down => {
+                        let history = HISTORY.lock();
+                        match history_pos {
+                            None => {} // already at the blank line, nothing newer
+                            Some(p) if p + 1 < history.len() => {
+                                let next_pos = p + 1;
+                                history_pos = Some(next_pos);
+                                let entry = history[next_pos].clone();
+                                drop(history);
+                                replace_line(&mut line, &mut cursor, entry);
+                            }
+                            Some(_) => {
+                                history_pos = None;
+                                drop(history);
+                                replace_line(&mut line, &mut cursor, alloc::vec::Vec::new());
+                            }
+                        }
+                    }
+                    EditAction::Unknown => {}
+                }
+            }
+            0x08 | 0x7F => {
+                // Backspace/DEL: remove the character before the
+                // cursor, if any. A trailing backspace (cursor at the
+                // end) is the common case and stays cheap; editing
+                // mid-line requires reflowing everything after it.
+                if cursor > 0 {
+                    cursor -= 1;
+                    line.remove(cursor);
+                    console_write(b"\x08");
+                    redraw_tail(&line, cursor, cursor);
+                }
+            }
+            b => {
+                if line.len() + 1 < max {
+                    if cursor == line.len() {
+                        line.push(b);
+                        console_write(&[b]);
+                        cursor += 1;
+                    } else {
+                        line.insert(cursor, b);
+                        cursor += 1;
+                        // Redraw from the inserted character onward (not
+                        // from `cursor` alone) so it's drawn exactly
+                        // once, then walk the terminal cursor back to
+                        // just after it.
+                        console_write(&line[cursor - 1..]);
+                        for _ in 0..(line.len() - cursor) {
+                            console_write(b"\x08");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Record non-empty, non-history-recalled lines for future recall.
+    // (The trailing '\n' is stripped for storage and reattached to
+    // whatever's returned to the caller as usual.)
+    if line.len() > 1 {
+        let mut h = HISTORY.lock();
+        let stored = line[..line.len() - 1].to_vec();
+        if h.back() != Some(&stored) {
+            if h.len() == HISTORY_CAP {
+                h.pop_front();
+            }
+            h.push_back(stored);
+        }
+    }
+
+    line
+}
+
+fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
+    if fd != 0 {
+        return errno(EBADF);
+    }
+    let n = (len as usize).min(MAX_WRITE);
+    if n == 0 {
+        return 0;
+    }
+    let line = read_line(n);
+    if !vmm::copy_to_user(buf, &line) {
+        return errno(EFAULT);
+    }
+    line.len() as u64
+}
+
+/// Longest path/file name the file stopgap syscalls accept.
+const MAX_NAME: usize = 255;
+
+fn sys_list_files(buf: u64, len: u64) -> u64 {
+    let cap = (len as usize).min(MAX_WRITE);
+    let mut out = alloc::vec::Vec::new();
+    for e in crate::initramfs::entries() {
+        if !out.is_empty() {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(e.name.as_bytes());
+    }
+    if out.len() > cap {
+        return errno(ERANGE);
+    }
+    if !vmm::copy_to_user(buf, &out) {
+        return errno(EFAULT);
+    }
+    out.len() as u64
+}
+
+fn sys_read_file(name_ptr: u64, name_len: u64, buf: u64, buf_len: u64) -> u64 {
+    let name_len = name_len as usize;
+    if name_len > MAX_NAME {
+        return errno(ENAMETOOLONG);
+    }
+    let mut name = alloc::vec![0u8; name_len];
+    if !vmm::copy_from_user(&mut name, name_ptr) {
+        return errno(EFAULT);
+    }
+    let Ok(name) = core::str::from_utf8(&name) else {
+        return errno(ENOENT);
+    };
+    let Some(data) = crate::initramfs::find(name) else {
+        return errno(ENOENT);
+    };
+    let cap = (buf_len as usize).min(MAX_WRITE);
+    if data.len() > cap {
+        return errno(ERANGE);
+    }
+    if !vmm::copy_to_user(buf, data) {
+        return errno(EFAULT);
+    }
+    data.len() as u64
 }
 
 fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
@@ -265,7 +591,10 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
     crate::idt::enable_interrupts();
 
     match frame.rax {
+        SYS_READ => frame.rax = sys_read(frame.rdi, frame.rsi, frame.rdx),
         SYS_WRITE => frame.rax = sys_write(frame.rdi, frame.rsi, frame.rdx),
+        SYS_LIST_FILES => frame.rax = sys_list_files(frame.rdi, frame.rsi),
+        SYS_READ_FILE => frame.rax = sys_read_file(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         SYS_SCHED_YIELD => {
             scheduler::yield_now();
             frame.rax = 0;

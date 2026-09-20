@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod blocking;
 pub mod console;
+pub mod drivers;
 pub mod elf;
 pub mod framebuffer;
 pub mod gdt;
@@ -76,6 +77,12 @@ unsafe extern "C" fn _start() -> ! {
     pit::init(1000); // 1kHz tick, i.e. 1ms resolution
     idt::enable_interrupts();
     pit::self_test();
+
+    // Keyboard drivers need the PIC/IDT (for IRQ1) already up, which
+    // they are by this point, but come before the scheduler so a typed
+    // command doesn't have to wait on anything else finishing init.
+    drivers::ps2::init();
+    drivers::usb::init();
 
     scheduler::init();
     scheduler::self_test();

@@ -40,7 +40,7 @@ const INIT_PATH: &str = "/init";
 /// something and quits. Set to `false` once `/init` is a long-running
 /// program (a shell, a service manager), so boot doesn't sit waiting for
 /// something that never ends.
-const WAIT_FOR_INIT: bool = true;
+const WAIT_FOR_INIT: bool = false;
 const INIT_TIMEOUT_MS: u64 = 5000;
 
 struct Record {
