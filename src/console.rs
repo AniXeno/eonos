@@ -1,40 +1,28 @@
-//! Framebuffer text console.
-//!
-//! * Glyphs come from a PSF1/PSF2 bitmap font embedded from `font.psf`
-//!   (any size; swap the file and rebuild to change the look).
-//! * Colour is controlled with ANSI SGR escapes (`ESC [ ... m`), so the same
-//!   formatted text can go to both the serial port and the screen.
-
 use core::fmt;
 use spin::Mutex;
 
 use crate::framebuffer::FbInfo;
 
-/// The console font. Must be an *uncompressed* PSF1 or PSF2 file.
 static FONT_DATA: &[u8] = include_bytes!("../font.psf");
 
-/// 16-colour palette (0x00RRGGBB): 0-7 normal, 8-15 bright. "One Dark"-ish.
+
 const PALETTE: [u32; 16] = [
-    0x001B1F27, 0x00E06C75, 0x0098C379, 0x00E5C07B, // black red green yellow
-    0x0061AFEF, 0x00C678DD, 0x0056B6C2, 0x00ABB2BF, // blue magenta cyan white
-    0x004B5263, 0x00FF7B86, 0x00B5E890, 0x00FFD98E, // bright: black red green yellow
-    0x0082C4FF, 0x00E09BFF, 0x007FDCE8, 0x00FFFFFF, // bright: blue magenta cyan white
+    0x001B1F27, 0x00E06C75, 0x0098C379, 0x00E5C07B,
+    0x0061AFEF, 0x00C678DD, 0x0056B6C2, 0x00ABB2BF, 
+    0x004B5263, 0x00FF7B86, 0x00B5E890, 0x00FFD98E, 
+    0x0082C4FF, 0x00E09BFF, 0x007FDCE8, 0x00FFFFFF, 
 ];
 
 const DEFAULT_FG: u32 = PALETTE[7];
-const DEFAULT_BG: u32 = 0x00000000; // black
+const DEFAULT_BG: u32 = 0x00000000; 
 
 pub static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
-
-// ---------------------------------------------------------------------------
-// PSF font
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 struct Font {
     glyphs: &'static [u8],
     num_glyphs: usize,
-    charsize: usize, // bytes per glyph
+    charsize: usize,
     width: usize,
     height: usize,
     bytes_per_row: usize,
@@ -44,13 +32,11 @@ impl Font {
     fn parse(data: &'static [u8]) -> Option<Font> {
         let (headersize, num_glyphs, charsize, width, height) =
             if data.len() >= 32 && data.starts_with(&[0x72, 0xb5, 0x4a, 0x86]) {
-                // PSF2: magic, version, headersize, flags, length, charsize, height, width
                 let rd = |o: usize| {
                     u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize
                 };
                 (rd(8), rd(16), rd(20), rd(28), rd(24))
             } else if data.len() >= 4 && data[0] == 0x36 && data[1] == 0x04 {
-                // PSF1: magic(2), mode, charsize (= height); always 8 pixels wide
                 let num = if data[2] & 1 != 0 { 512 } else { 256 };
                 (4, num, data[3] as usize, 8, data[3] as usize)
             } else {
@@ -76,8 +62,6 @@ impl Font {
         })
     }
 
-    /// Bitmap for `ch`. Glyph N is codepoint N (true for ASCII in every
-    /// common PSF); anything the font lacks falls back to '?'.
     fn glyph(&self, ch: char) -> &'static [u8] {
         let mut idx = ch as usize;
         if idx >= self.num_glyphs {
@@ -91,15 +75,11 @@ impl Font {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Console
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EscState {
     Normal,
-    Escape, // saw ESC
-    Csi,    // saw ESC [
+    Escape, 
+    Csi,    
 }
 
 pub struct Console {
@@ -114,12 +94,10 @@ pub struct Console {
     cursor_col: usize,
     cursor_row: usize,
 
-    // colour state
     fg: u32,
     bg: u32,
     bold: bool,
 
-    // escape-sequence parser state
     esc: EscState,
     params: [u32; 8],
     nparams: usize,
@@ -155,8 +133,6 @@ impl Console {
         }
     }
 
-    // ---- pixel helpers ----------------------------------------------------
-
     fn put_pixel(&mut self, x: usize, y: usize, color: u32) {
         if x >= self.width || y >= self.height {
             return;
@@ -184,7 +160,6 @@ impl Console {
         }
     }
 
-    /// Console width in character cells.
     pub fn cols(&self) -> usize {
         self.cols
     }
@@ -195,8 +170,6 @@ impl Console {
         self.cursor_col = 0;
         self.cursor_row = 0;
     }
-
-    // ---- text drawing -----------------------------------------------------
 
     fn draw_glyph(&mut self, ch: char, col: usize, row: usize) {
         let font = self.font;
@@ -242,8 +215,6 @@ impl Console {
         self.cursor_col += 1;
     }
 
-    // ---- ANSI colour escapes ------------------------------------------------
-
     fn push_param(&mut self) {
         let v = if self.have_cur { self.cur } else { 0 };
         if self.nparams < self.params.len() {
@@ -254,8 +225,6 @@ impl Console {
         self.have_cur = false;
     }
 
-    /// Parse `2;r;g;b` following a 38/48 code at index `i`.
-    /// Returns (colour, number of extra params consumed).
     fn extended_color(&self, i: usize) -> Option<(u32, usize)> {
         let n = self.nparams;
         if i + 4 < n && self.params[i + 1] == 2 {
@@ -269,7 +238,7 @@ impl Console {
             if idx < 16 {
                 return Some((PALETTE[idx], 2));
             }
-            return Some((DEFAULT_FG, 2)); // 256-colour cube not supported
+            return Some((DEFAULT_FG, 2)); 
         }
         None
     }
@@ -311,10 +280,7 @@ impl Console {
         }
     }
 
-    // ---- character dispatch ---------------------------------------------------
-
     fn put_char(&mut self, c: char) {
-        // ESC always (re)starts an escape sequence, even mid-sequence.
         if c == '\x1b' {
             self.esc = EscState::Escape;
             return;
@@ -344,7 +310,7 @@ impl Console {
                         self.apply_sgr();
                         self.esc = EscState::Normal;
                     }
-                    _ => self.esc = EscState::Normal, // unsupported sequence: drop it
+                    _ => self.esc = EscState::Normal,
                 }
                 return;
             }
@@ -404,14 +370,11 @@ pub fn init() {
 
     console.clear();
 
-    // Read these now: logging below must not touch CONSOLE while it is
-    // locked (log_ok! holds LOGGER, and Logger::log() locks CONSOLE).
     let (cols, rows) = (console.cols, console.rows);
 
     *CONSOLE.lock() = Some(console);
     drop(fb_guard);
 
-    // Replay early logs first so the screen shows them in order.
     crate::logger::flush_to_console();
 
     crate::log_ok!(
