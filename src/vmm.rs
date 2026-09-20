@@ -12,12 +12,20 @@ use crate::{log_debug, log_fail, log_ok};
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
+const PWT: u64 = 1 << 3;
 const HUGE: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
 
 pub const KERNEL_RX: u64 = PRESENT;
 pub const KERNEL_RO: u64 = PRESENT | NO_EXECUTE;
 pub const KERNEL_RW: u64 = PRESENT | WRITABLE | NO_EXECUTE;
+/// Write-combining: for framebuffers and other linear MMIO the CPU may
+/// buffer and merge writes to. See `configure_pat` for how the PWT bit
+/// ends up meaning "write-combining" instead of its default "write-
+/// through". Never use this for memory that's read back right after
+/// being written (WC writes can sit in a fill buffer for a while) or for
+/// device registers with side effects on individual writes.
+pub const KERNEL_WC: u64 = PRESENT | WRITABLE | NO_EXECUTE | PWT;
 
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const ENTRIES: usize = 512;
@@ -197,6 +205,49 @@ unsafe fn enable_nxe() {
     asm!("wrmsr", in("ecx") EFER, in("eax") lo, in("edx") hi, options(nomem, nostack, preserves_flags));
 }
 
+/// Repurpose PAT slot 1 as Write-Combining.
+///
+/// The IA32_PAT MSR holds eight 8-bit memory-type slots; which slot a
+/// page uses is selected by the PAT/PCD/PWT bits in its page table
+/// entry. Firmware's default PAT leaves slot 1 (selected by PWT=1,
+/// PCD=0, PAT=0) as Write-Through, a leftover from before PAT existed.
+/// We overwrite just that slot with Write-Combining (memory type 0x01),
+/// which means any page mapped with the PWT bit set (and PCD/PAT clear)
+/// — see `KERNEL_WC` — becomes WC without ever needing to touch the PAT
+/// bit itself, which conveniently sits in a different position on 4K
+/// PTEs (bit 7) than on 2M/1G huge-page entries (bit 12).
+///
+/// This matters because on real hardware, MMIO regions like a linear
+/// framebuffer default to Uncacheable: every write is a small,
+/// individually-serialized bus transaction. WC lets the CPU buffer and
+/// merge writes before flushing them out, which is the difference
+/// between fast and unusably slow pixel plotting. QEMU's emulated
+/// framebuffer doesn't model this cost, which is why the slowdown only
+/// shows up on real hardware.
+unsafe fn configure_pat() {
+    const PAT_MSR: u32 = 0x277;
+    const WRITE_COMBINING: u64 = 0x01;
+
+    // Flush and invalidate caches before changing a memory type that
+    // may already be in use (Intel SDM Vol. 3A 11.11.8), and again
+    // after, so nothing straddles the change with stale attributes.
+    asm!("wbinvd", options(nomem, nostack));
+
+    let lo: u32;
+    let hi: u32;
+    asm!("rdmsr", in("ecx") PAT_MSR, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+    let mut value = ((hi as u64) << 32) | lo as u64;
+
+    value &= !(0xFFu64 << 8);
+    value |= WRITE_COMBINING << 8;
+
+    let lo = value as u32;
+    let hi = (value >> 32) as u32;
+    asm!("wrmsr", in("ecx") PAT_MSR, in("eax") lo, in("edx") hi, options(nomem, nostack, preserves_flags));
+
+    asm!("wbinvd", options(nomem, nostack));
+}
+
 unsafe fn map_kernel_sections(pml4: *mut Table, kernel_phys: u64, kernel_virt: u64) {
     let to_phys = |v: u64| kernel_phys + (v - kernel_virt);
 
@@ -229,6 +280,7 @@ unsafe fn map_kernel_sections(pml4: *mut Table, kernel_phys: u64, kernel_virt: u
 
 pub fn init() {
     unsafe { enable_nxe() };
+    unsafe { configure_pat() };
 
     let Some(ka) = KERNEL_ADDRESS_REQUEST.get_response() else {
         log_fail!("VMM", "Init", "Limine gave us no kernel address info");
@@ -263,7 +315,7 @@ pub fn init() {
                 let end = align_up(fb_phys + fb.pitch * fb.height, PAGE_SIZE);
                 let mut p = start;
                 while p < end {
-                    map4k(pml4, hhdm + p, p, KERNEL_RW);
+                    map4k(pml4, hhdm + p, p, KERNEL_WC);
                     p += PAGE_SIZE;
                 }
             }
@@ -280,7 +332,7 @@ pub fn init() {
     log_ok!(
         "VMM",
         "Init",
-        "Own page tables active ({} physical mapped, cr3 {:#x} -> {:#x})",
+        "Own page tables active ({} physical mapped, cr3 {:#x} -> {:#x}, PAT slot 1 = write-combining)",
         Size(phys_top),
         old_cr3,
         pml4_phys

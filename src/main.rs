@@ -42,6 +42,7 @@ unsafe extern "C" fn _start() -> ! {
 
     framebuffer::init();
     framebuffer::self_test();
+    framebuffer::bench("pre-VMM, bootloader mapping");
     console::init();
 
     gdt::init();
@@ -59,6 +60,7 @@ unsafe extern "C" fn _start() -> ! {
 
     vmm::init();
     vmm::self_test();
+    framebuffer::bench("post-VMM, write-combining");
 
     heap::init();
     heap::self_test();
@@ -68,7 +70,7 @@ unsafe extern "C" fn _start() -> ! {
     idt::enable_interrupts();
     pit::self_test();
 
-    // TODO: scheduler/processes go here.
+    // TODO: scheduler and processes!
 
     log_ok!("Kernel", "Init", "Initialization complete, halting");
 
