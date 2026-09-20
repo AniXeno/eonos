@@ -139,10 +139,13 @@ static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 /// How many times a thread was preempted by the timer.
 static PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
 
-enum Next {
+enum Next<'a> {
     Yield,
     Sleep(u64),
     Exit,
+    /// Park the current thread on an external queue instead of `ready`
+    /// or `sleeping`. Used by `WaitQueue::wait_until`.
+    Block(&'a IrqMutex<VecDeque<Box<Thread>>>),
 }
 
 fn slot_base(slot: usize) -> u64 {
@@ -256,7 +259,7 @@ fn wake_sleepers(s: &mut Scheduler) {
 /// Take the current thread off the CPU (yielding, sleeping or exiting)
 /// and run the next one. Returns when this thread is scheduled again;
 /// for `Next::Exit` it never does.
-fn reschedule(how: Next) {
+fn reschedule(how: Next<'_>) {
     let saved = sync::irq_save();
 
     // Whoever runs next gets a fresh time slice.
@@ -285,6 +288,13 @@ fn reschedule(how: Next) {
                 s.sleeping.push(cur);
             }
             Next::Exit => s.zombies.push(cur),
+            Next::Block(queue) => {
+                // Locking `queue` while `guard` (SCHED) is held is safe:
+                // this is a single-core scheduler and both locks disable
+                // interrupts, so there is no real concurrency to race
+                // against, only nesting, which `IrqMutex` handles fine.
+                queue.lock().push_back(cur);
+            }
         }
 
         let mut next = match s.ready.pop_front() {
@@ -447,6 +457,103 @@ pub fn current_name() -> &'static str {
 pub fn stack_slots_in_use() -> usize {
     let s = SCHED.lock();
     s.next_slot - s.free_slots.len()
+}
+
+// ---------------------------------------------------------------------
+// Blocking primitives
+// ---------------------------------------------------------------------
+
+/// A queue of threads parked waiting for some condition, plus the
+/// primitive other synchronization types (blocking `Mutex`, `Semaphore`,
+/// ...) are built on. Unlike `sleep_ms`, threads on a `WaitQueue` are
+/// not touched by the timer at all: they only become ready again
+/// through `wake_one`/`wake_all`, so this costs nothing while blocked
+/// and wakes are exact instead of poll-driven.
+///
+/// `wait_until` is the primitive to reach for: it evaluates `cond`
+/// and, if the thread needs to block, parks it on the queue in the
+/// same interrupts-off critical section, so a wakeup that happens
+/// between the check and the park can never be lost. Plain `wait()` has
+/// no such guard and is only safe when the caller has independently
+/// ruled out a racing wakeup (e.g. nothing else can run yet).
+pub struct WaitQueue {
+    waiters: IrqMutex<VecDeque<Box<Thread>>>,
+}
+
+impl WaitQueue {
+    pub const fn new() -> Self {
+        WaitQueue {
+            waiters: IrqMutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Block the current thread until `cond` returns `true`.
+    ///
+    /// `cond` is called with interrupts disabled; if it returns `false`
+    /// the thread is parked on this queue and switched away *before*
+    /// interrupts come back on, so nothing can slip a wakeup in between
+    /// the check and the park. `cond` may be called more than once
+    /// (once per wakeup, spuriously or not) and must be cheap and
+    /// side-effect-safe to repeat -- exactly like a condition variable
+    /// predicate.
+    pub fn wait_until<F: FnMut() -> bool>(&self, mut cond: F) {
+        loop {
+            let saved = sync::irq_save();
+            if cond() {
+                sync::irq_restore(saved);
+                return;
+            }
+            if !READY.load(Ordering::SeqCst) {
+                // Scheduler isn't up yet; nobody could ever wake us.
+                sync::irq_restore(saved);
+                return;
+            }
+            // `reschedule` manages its own (nested) interrupt state and
+            // only returns here once we've been woken and rescheduled.
+            reschedule(Next::Block(&self.waiters));
+            sync::irq_restore(saved);
+        }
+    }
+
+    /// Unconditionally park the current thread here. Only safe when the
+    /// caller can guarantee nothing wakes this queue before the thread
+    /// is actually parked; prefer `wait_until` otherwise.
+    pub fn wait(&self) {
+        if !READY.load(Ordering::SeqCst) {
+            return;
+        }
+        reschedule(Next::Block(&self.waiters));
+    }
+
+    /// Move one waiting thread (if any) back onto the ready queue.
+    /// Returns whether a thread was woken.
+    pub fn wake_one(&self) -> bool {
+        let woken = self.waiters.lock().pop_front();
+        match woken {
+            Some(t) => {
+                SCHED.lock().ready.push_back(t);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Move every waiting thread back onto the ready queue.
+    pub fn wake_all(&self) {
+        let all: Vec<Box<Thread>> = self.waiters.lock().drain(..).collect();
+        if all.is_empty() {
+            return;
+        }
+        let mut s = SCHED.lock();
+        for t in all {
+            s.ready.push_back(t);
+        }
+    }
+
+    /// Number of threads currently parked here. For diagnostics/tests.
+    pub fn len(&self) -> usize {
+        self.waiters.lock().len()
+    }
 }
 
 // ---------------------------------------------------------------------

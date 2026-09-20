@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+pub mod blocking;
 pub mod console;
 pub mod framebuffer;
 pub mod gdt;
@@ -74,6 +75,8 @@ unsafe extern "C" fn _start() -> ! {
 
     scheduler::init();
     scheduler::self_test();
+
+    blocking::self_test();
 
     // TODO: processes! (user mode, syscalls, ELF loader)
 
