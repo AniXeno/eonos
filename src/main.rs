@@ -1,12 +1,17 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 pub mod console;
 pub mod framebuffer;
 pub mod gdt;
+pub mod heap;
 pub mod idt;
 pub mod logger;
 pub mod panic_screen;
+pub mod pic;
+pub mod pit;
 pub mod pmm;
 pub mod serial;
 pub mod vmm;
@@ -55,7 +60,15 @@ unsafe extern "C" fn _start() -> ! {
     vmm::init();
     vmm::self_test();
 
-    // TODO: heap allocator, then scheduler/processes go here.
+    heap::init();
+    heap::self_test();
+
+    pic::init();
+    pit::init(1000); // 1kHz tick, i.e. 1ms resolution
+    idt::enable_interrupts();
+    pit::self_test();
+
+    // TODO: scheduler/processes go here.
 
     log_ok!("Kernel", "Init", "Initialization complete, halting");
 

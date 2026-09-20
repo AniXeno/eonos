@@ -13,7 +13,7 @@ if [ ! -f "$ISO_NAME" ]; then
     ./build.sh
 fi
 
-ARGS=(-M q35 -vga std -m 256M -serial stdio -cdrom "$ISO_NAME" -boot d)
+ARGS=(-M q35 -vga std -m 2G -serial stdio -cdrom "$ISO_NAME" -boot d)
 
 if [ "$UEFI" = "1" ]; then
     OVMF_CODE="/usr/share/edk2/x64/OVMF_CODE.4m.fd"

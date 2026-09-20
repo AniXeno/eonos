@@ -1,11 +1,19 @@
 use core::fmt::Write;
 use core::ptr::{addr_of, addr_of_mut};
 
+use spin::Mutex;
+
 use crate::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
 use crate::{log_critical, log_debug, log_ok};
 
 const IDT_ENTRIES: usize = 256;
 const GATE_INTERRUPT: u8 = 0x8E;
+
+/// Vector the remapped PIC's IRQ0 lands on (see `pic::IRQ_BASE`); IRQs
+/// occupy vectors [IRQ_BASE, IRQ_BASE + IRQ_COUNT).
+const IRQ_BASE: usize = 32;
+const IRQ_COUNT: usize = 16;
+const TOTAL_VECTORS: usize = IRQ_BASE + IRQ_COUNT;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -50,6 +58,27 @@ struct Idtr {
 }
 
 static mut IDT: [Entry; IDT_ENTRIES] = [Entry::MISSING; IDT_ENTRIES];
+
+/// A registered IRQ handler takes no arguments — drivers that need the
+/// interrupt frame (none do yet) can register through a richer mechanism
+/// later; a tick counter or "data ready" flag doesn't need one.
+type IrqHandler = fn();
+
+static IRQ_HANDLERS: Mutex<[Option<IrqHandler>; IRQ_COUNT]> = Mutex::new([None; IRQ_COUNT]);
+
+/// Wire `handler` up to fire whenever IRQ `irq` (0-15, as delivered by
+/// the PIC) arrives. Does not unmask the line — call `pic::unmask` too.
+pub fn register_irq(irq: u8, handler: IrqHandler) {
+    IRQ_HANDLERS.lock()[irq as usize] = Some(handler);
+}
+
+pub fn enable_interrupts() {
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+}
+
+pub fn disable_interrupts() {
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+}
 
 #[repr(C)]
 pub struct InterruptFrame {
@@ -160,6 +189,23 @@ isr_stub_\num:
     isr_err 30
     isr_noerr 31
 
+    isr_noerr 32
+    isr_noerr 33
+    isr_noerr 34
+    isr_noerr 35
+    isr_noerr 36
+    isr_noerr 37
+    isr_noerr 38
+    isr_noerr 39
+    isr_noerr 40
+    isr_noerr 41
+    isr_noerr 42
+    isr_noerr 43
+    isr_noerr 44
+    isr_noerr 45
+    isr_noerr 46
+    isr_noerr 47
+
 isr_common:
     push rax
     push rbx
@@ -233,19 +279,35 @@ isr_stub_table:
     .quad isr_stub_29
     .quad isr_stub_30
     .quad isr_stub_31
+    .quad isr_stub_32
+    .quad isr_stub_33
+    .quad isr_stub_34
+    .quad isr_stub_35
+    .quad isr_stub_36
+    .quad isr_stub_37
+    .quad isr_stub_38
+    .quad isr_stub_39
+    .quad isr_stub_40
+    .quad isr_stub_41
+    .quad isr_stub_42
+    .quad isr_stub_43
+    .quad isr_stub_44
+    .quad isr_stub_45
+    .quad isr_stub_46
+    .quad isr_stub_47
 .section .text
 "#);
 
 #[allow(non_upper_case_globals)]
 extern "C" {
-    static isr_stub_table: [u64; 32];
+    static isr_stub_table: [u64; TOTAL_VECTORS];
 }
 
 pub fn init() {
     unsafe {
         let idt = addr_of_mut!(IDT) as *mut Entry;
 
-        for vector in 0..32usize {
+        for vector in 0..TOTAL_VECTORS {
             let handler = isr_stub_table[vector];
             let ist = if vector == 8 { DOUBLE_FAULT_IST } else { 0 };
             idt.add(vector)
@@ -263,17 +325,40 @@ pub fn init() {
         );
     }
 
-    log_ok!("IDT", "Init", "32 CPU exception handlers installed (double fault on its own stack)");
+    log_ok!(
+        "IDT",
+        "Init",
+        "32 CPU exception handlers + 16 IRQ vectors ({}-{}) installed (double fault on its own stack)",
+        IRQ_BASE,
+        IRQ_BASE + IRQ_COUNT - 1
+    );
 }
 
 #[no_mangle]
 extern "C" fn exception_handler(frame: &mut InterruptFrame) {
+    if frame.vector as usize >= IRQ_BASE {
+        irq_dispatch(frame);
+        return;
+    }
+
     match frame.vector {
         3 => {
             log_debug!("CPU", "Exception", "Breakpoint (#BP) at rip={:#018x}", frame.rip);
         }
         _ => fatal(frame),
     }
+}
+
+fn irq_dispatch(frame: &InterruptFrame) {
+    let irq = (frame.vector as usize - IRQ_BASE) as u8;
+
+    let handler = IRQ_HANDLERS.lock()[irq as usize];
+    match handler {
+        Some(handler) => handler(),
+        None => log_debug!("IRQ", "Unhandled", "IRQ{} fired with no registered handler", irq),
+    }
+
+    crate::pic::end_of_interrupt(irq);
 }
 
 fn read_cr2() -> u64 {

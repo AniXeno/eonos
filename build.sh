@@ -12,11 +12,17 @@ ISO_ROOT="iso_root"
 ISO_NAME="eonos.iso"
 
 echo "==> Building kernel (profile: $PROFILE)"
+BUILD_STD_FLAGS=(
+    -Zjson-target-spec
+    -Zbuild-std=core,alloc,compiler_builtins
+    -Zbuild-std-features=compiler-builtins-mem
+)
+
 if [ "$PROFILE" = "release" ]; then
-    cargo build --release -Zjson-target-spec --target x86_64-eonos.json
+    cargo build --release "${BUILD_STD_FLAGS[@]}" --target x86_64-eonos.json
     KERNEL_BIN="$TARGET_DIR/release/eonos"
 else
-    cargo build -Zjson-target-spec --target x86_64-eonos.json
+    cargo build "${BUILD_STD_FLAGS[@]}" --target x86_64-eonos.json
     KERNEL_BIN="$TARGET_DIR/debug/eonos"
 fi
 
