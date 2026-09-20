@@ -1,9 +1,9 @@
 use core::fmt;
-use spin::Mutex;
+use crate::sync::IrqMutex;
 
 const COM1: u16 = 0x3F8;
 
-pub static SERIAL1: Mutex<SerialPort> = Mutex::new(SerialPort::new(COM1));
+pub static SERIAL1: IrqMutex<SerialPort> = IrqMutex::new(SerialPort::new(COM1));
 
 pub struct SerialPort {
     port: u16,

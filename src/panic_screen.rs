@@ -30,6 +30,7 @@ pub fn show<F>(title: &str, rgb: (u8, u8, u8), body: F) -> !
 where
     F: FnOnce(&mut Console),
 {
+    crate::idt::disable_interrupts();
     force_unlock_all();
 
     if let Some(console) = CONSOLE.lock().as_mut() {

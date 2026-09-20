@@ -62,6 +62,9 @@ pub fn init(hz: u32) {
 
 fn on_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    // Let the scheduler decide whether to preempt (the actual switch
+    // happens after the EOI, in `idt::irq_dispatch`).
+    crate::scheduler::tick();
 }
 
 /// Ticks observed since `init()`.

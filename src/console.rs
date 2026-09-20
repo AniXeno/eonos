@@ -1,5 +1,5 @@
 use core::fmt;
-use spin::Mutex;
+use crate::sync::IrqMutex;
 
 use crate::framebuffer::FbInfo;
 
@@ -16,7 +16,7 @@ const PALETTE: [u32; 16] = [
 const DEFAULT_FG: u32 = PALETTE[7];
 const DEFAULT_BG: u32 = 0x00000000; 
 
-pub static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
+pub static CONSOLE: IrqMutex<Option<Console>> = IrqMutex::new(None);
 
 #[derive(Clone, Copy)]
 struct Font {

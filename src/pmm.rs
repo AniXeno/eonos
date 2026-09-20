@@ -5,7 +5,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
 use limine::memory_map::EntryType;
 use limine::request::{HhdmRequest, MemoryMapRequest};
-use spin::Mutex;
+use crate::sync::IrqMutex;
 
 use crate::{log_debug, log_fail, log_ok};
 
@@ -254,7 +254,7 @@ impl Pmm {
     }
 }
 
-static PMM: Mutex<Option<Pmm>> = Mutex::new(None);
+static PMM: IrqMutex<Option<Pmm>> = IrqMutex::new(None);
 
 pub fn hhdm_offset() -> u64 {
     HHDM_OFFSET.load(Ordering::Relaxed)
@@ -306,6 +306,39 @@ pub fn free_frames(phys: u64, count: usize) {
             e.as_str()
         );
     }
+}
+
+/// Physical ranges (page-aligned, `[start, end)`) that belong in the
+/// higher-half direct map: RAM, the kernel image/modules, and ACPI
+/// tables. Holes, MMIO, reserved and bad memory are deliberately left
+/// out, and so is the framebuffer (the VMM maps it separately as
+/// write-combining). Returned by value so the caller can map pages
+/// (which takes the PMM lock) without holding it.
+pub fn hhdm_ranges() -> ([(u64, u64); MAX_REGIONS], usize) {
+    let mut out = [(0u64, 0u64); MAX_REGIONS];
+    let mut n = 0usize;
+    let guard = PMM.lock();
+    let Some(pmm) = guard.as_ref() else {
+        return (out, 0);
+    };
+    for r in &pmm.regions[..pmm.region_count] {
+        match r.kind {
+            Kind::Usable
+            | Kind::BootloaderReclaimable
+            | Kind::KernelAndModules
+            | Kind::AcpiReclaimable
+            | Kind::AcpiNvs => {
+                let start = align_down(r.base, PAGE_SIZE);
+                let end = align_up(r.base + r.len, PAGE_SIZE);
+                if end > start {
+                    out[n] = (start, end);
+                    n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    (out, n)
 }
 
 pub fn free_frame_count() -> usize {

@@ -1,5 +1,5 @@
 use core::fmt::{self, Write};
-use spin::Mutex;
+use crate::sync::IrqMutex;
 
 use crate::console::CONSOLE;
 use crate::serial::SERIAL1;
@@ -56,7 +56,7 @@ pub struct Logger {
     early_count: usize,
 }
 
-pub static LOGGER: Mutex<Logger> = Mutex::new(Logger {
+pub static LOGGER: IrqMutex<Logger> = IrqMutex::new(Logger {
     use_color: true,
     early_buffer: [const { LogEntry { buf: [0; MAX_LINE_LEN], len: 0 } }; EARLY_LOG_CAPACITY],
     early_count: 0,

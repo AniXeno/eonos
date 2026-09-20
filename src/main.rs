@@ -13,7 +13,9 @@ pub mod panic_screen;
 pub mod pic;
 pub mod pit;
 pub mod pmm;
+pub mod scheduler;
 pub mod serial;
+pub mod sync;
 pub mod vmm;
 
 use core::fmt::Write;
@@ -70,11 +72,15 @@ unsafe extern "C" fn _start() -> ! {
     idt::enable_interrupts();
     pit::self_test();
 
-    // TODO: scheduler and processes!
+    scheduler::init();
+    scheduler::self_test();
 
-    log_ok!("Kernel", "Init", "Initialization complete, halting");
+    // TODO: processes! (user mode, syscalls, ELF loader)
 
-    hcf();
+    log_ok!("Kernel", "Init", "Initialization complete, handing over to the scheduler");
+
+    // The boot thread is done; the idle thread takes over from here.
+    scheduler::exit();
 }
 
 fn hcf() -> ! {

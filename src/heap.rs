@@ -14,9 +14,8 @@ use core::fmt;
 use core::mem::{align_of, size_of};
 use core::ptr;
 
-use spin::Mutex;
-
 use crate::pmm;
+use crate::sync::IrqMutex;
 use crate::vmm;
 use crate::{log_debug, log_fail, log_ok};
 
@@ -252,13 +251,13 @@ fn adjust(layout: Layout) -> (usize, usize) {
 }
 
 pub struct KernelHeap {
-    inner: Mutex<FreeList>,
+    inner: IrqMutex<FreeList>,
 }
 
 impl KernelHeap {
     const fn new() -> Self {
         KernelHeap {
-            inner: Mutex::new(FreeList::new()),
+            inner: IrqMutex::new(FreeList::new()),
         }
     }
 }

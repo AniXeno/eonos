@@ -1,9 +1,8 @@
 use core::fmt::Write;
 use core::ptr::{addr_of, addr_of_mut};
 
-use spin::Mutex;
-
 use crate::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
+use crate::sync::IrqMutex;
 use crate::{log_critical, log_debug, log_ok};
 
 const IDT_ENTRIES: usize = 256;
@@ -64,7 +63,7 @@ static mut IDT: [Entry; IDT_ENTRIES] = [Entry::MISSING; IDT_ENTRIES];
 /// later; a tick counter or "data ready" flag doesn't need one.
 type IrqHandler = fn();
 
-static IRQ_HANDLERS: Mutex<[Option<IrqHandler>; IRQ_COUNT]> = Mutex::new([None; IRQ_COUNT]);
+static IRQ_HANDLERS: IrqMutex<[Option<IrqHandler>; IRQ_COUNT]> = IrqMutex::new([None; IRQ_COUNT]);
 
 /// Wire `handler` up to fire whenever IRQ `irq` (0-15, as delivered by
 /// the PIC) arrives. Does not unmask the line — call `pic::unmask` too.
@@ -359,6 +358,10 @@ fn irq_dispatch(frame: &InterruptFrame) {
     }
 
     crate::pic::end_of_interrupt(irq);
+
+    // Now that the PIC is free to deliver more interrupts, the scheduler
+    // may switch to another thread from inside this handler.
+    crate::scheduler::preempt_if_needed();
 }
 
 fn read_cr2() -> u64 {
@@ -466,7 +469,7 @@ fn fatal(frame: &InterruptFrame) -> ! {
         if vector == 14 {
             let cr2 = read_cr2();
             let _ = writeln!(w, "faulting address {:#018x}", cr2);
-            if let Some(phys) = crate::vmm::translate(cr2) {
+            if let Some(phys) = crate::vmm::try_translate(cr2) {
                 let _ = writeln!(
                     w,
                     "(that address is mapped to phys {:#018x} -- likely a permission violation)",
