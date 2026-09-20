@@ -3,7 +3,7 @@ use core::ptr::{addr_of, addr_of_mut};
 
 use crate::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
 use crate::sync::IrqMutex;
-use crate::{log_critical, log_debug, log_ok};
+use crate::{log_critical, log_debug, log_fail, log_ok};
 
 const IDT_ENTRIES: usize = 256;
 const GATE_INTERRUPT: u8 = 0x8E;
@@ -340,12 +340,59 @@ extern "C" fn exception_handler(frame: &mut InterruptFrame) {
         return;
     }
 
+    // A CPU exception taken while running user code is that process's
+    // problem, not the kernel's: kill the process and carry on. NMI,
+    // double fault and machine check are the exceptions to that -- they
+    // say something is wrong with the machine (or with the kernel's own
+    // handling), not merely with the program, and the double fault
+    // handler is running on its dedicated IST stack anyway.
+    if frame.cs & 3 == 3 && !matches!(frame.vector, 2 | 8 | 18) {
+        kill_user_process(frame);
+    }
+
     match frame.vector {
         3 => {
             log_debug!("CPU", "Exception", "Breakpoint (#BP) at rip={:#018x}", frame.rip);
         }
         _ => fatal(frame),
     }
+}
+
+/// Terminate the current (user) process after it caused a CPU
+/// exception. Runs on the process's kernel stack, so ending the thread
+/// from here is no different from ending it in a syscall. The exit
+/// status follows the shell convention for death by signal, 128 + the
+/// exception vector.
+fn kill_user_process(frame: &InterruptFrame) -> ! {
+    let name = EXCEPTION_NAMES
+        .get(frame.vector as usize)
+        .copied()
+        .unwrap_or("Unknown");
+
+    log_fail!(
+        "CPU",
+        "UserFault",
+        "{} in user mode (pid {}) - rip={:#018x} rsp={:#018x} error code {:#x}",
+        name,
+        crate::scheduler::current_id(),
+        frame.rip,
+        frame.rsp,
+        frame.error_code
+    );
+    if frame.vector == 14 {
+        let e = frame.error_code;
+        log_fail!(
+            "CPU",
+            "UserFault",
+            "page fault at {:#018x}: {} on {}{}",
+            read_cr2(),
+            if e & 1 != 0 { "protection violation" } else { "page not present" },
+            if e & 2 != 0 { "write" } else { "read" },
+            if e & 16 != 0 { " (instruction fetch)" } else { "" }
+        );
+    }
+
+    crate::process::exit_current(128 + frame.vector as i64)
 }
 
 fn irq_dispatch(frame: &InterruptFrame) {

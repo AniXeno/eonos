@@ -5,15 +5,24 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-ISO_NAME="eonos.iso"
+BUILD_DIR="$ROOT/build"
+ISO_PATH="$BUILD_DIR/iso_output/eonos.iso"
+
 UEFI="${UEFI:-1}"
 
-if [ ! -f "$ISO_NAME" ]; then
-    echo "No $ISO_NAME found, building it first..."
+if [ ! -f "$ISO_PATH" ]; then
+    echo "No built ISO found, building it first..."
     ./build.sh
 fi
 
-ARGS=(-M q35 -vga std -m 2G -serial stdio -cdrom "$ISO_NAME" -boot d)
+ARGS=(
+    -M q35
+    -vga std
+    -m 2G
+    -serial stdio
+    -cdrom "$ISO_PATH"
+    -boot d
+)
 
 if [ "$UEFI" = "1" ]; then
     OVMF_CODE="/usr/share/edk2/x64/OVMF_CODE.4m.fd"
@@ -30,13 +39,15 @@ if [ "$UEFI" = "1" ]; then
         exit 1
     fi
 
-    if [ ! -f "vars.fd" ]; then
-        cp "$OVMF_VARS" vars.fd
+    VARS_FILE="$BUILD_DIR/OVMF_VARS.fd"
+
+    if [ ! -f "$VARS_FILE" ]; then
+        cp "$OVMF_VARS" "$VARS_FILE"
     fi
 
     ARGS+=(
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE"
-        -drive if=pflash,format=raw,file=vars.fd
+        -drive if=pflash,format=raw,file="$VARS_FILE"
     )
 fi
 

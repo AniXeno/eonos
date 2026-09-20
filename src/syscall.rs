@@ -13,18 +13,24 @@
 //! same "top of this thread's kernel stack" value the scheduler already
 //! maintains for the hardware path -- to find a safe one.
 //!
-//! Self-test: since a per-process address space doesn't exist yet
-//! (that's the next step), the test maps a couple of user-accessible
-//! pages straight into the kernel's own address space, drops a
-//! dedicated thread into ring 3 to run a few hand-assembled
-//! instructions there, and checks that the `syscall` those instructions
-//! issue makes it back into the kernel with the right argument.
+//! Self-test: the test maps a couple of user-accessible pages straight
+//! into the kernel's own address space, drops a dedicated thread into
+//! ring 3 to run a few hand-assembled instructions there, and checks
+//! that the `syscall` those instructions issue makes it back into the
+//! kernel with the right argument. (Real processes, with their own
+//! address spaces, live in `process.rs`.)
+//!
+//! System calls follow the Linux x86-64 convention -- number in RAX,
+//! arguments in RDI/RSI/RDX/R10/R8/R9, result (or a negative errno) in
+//! RAX -- and reuse Linux's numbers for the calls that exist, so
+//! ordinary tools and libcs have a chance of working later.
 
 #![allow(dead_code)]
 
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::{gdt, pit, pmm, scheduler, vmm};
+use crate::{gdt, pit, pmm, process, scheduler, vmm};
 use crate::{log_debug, log_fail, log_ok};
 
 const MSR_EFER: u32 = 0xC000_0080;
@@ -111,6 +117,11 @@ syscall_entry:
     mov rdi, rsp
     cld
     call syscall_dispatch
+    # The dispatcher runs with interrupts enabled. Turn them off again
+    # before RSP is pointed back at the *user* stack below: an interrupt
+    # taken in ring 0 on a user-controlled stack would be a disaster.
+    # SYSRET restores IF from the saved RFLAGS (R11).
+    cli
     pop rax
     pop rdi
     pop rsi
@@ -139,6 +150,22 @@ enter_user_mode_asm:
     push rax        # RFLAGS
     push rdx        # CS
     push rdi        # RIP
+    # Don't leak kernel register contents into the new program.
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    xor esi, esi
+    xor edi, edi
+    xor ebp, ebp
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
     iretq
 "#
 );
@@ -181,9 +208,72 @@ pub fn init() {
     );
 }
 
+// System call numbers (Linux x86-64 numbering for the ones Linux has).
+pub const SYS_WRITE: u64 = 1;
+pub const SYS_SCHED_YIELD: u64 = 24;
+pub const SYS_GETPID: u64 = 39;
+pub const SYS_EXIT: u64 = 60;
+
+const EBADF: i64 = 9;
+const EFAULT: i64 = 14;
+const ENOSYS: i64 = 38;
+
+/// Encode a positive errno as the negative value a syscall returns.
+const fn errno(e: i64) -> u64 {
+    (-e) as u64
+}
+
+/// Longest run of bytes a single `write` will take; longer requests are
+/// short-written (callers loop, exactly as with Linux).
+const MAX_WRITE: usize = 4096;
+
+/// Put raw process output on the serial port and the screen, without
+/// the log decorations `klog!` adds.
+fn console_write(bytes: &[u8]) {
+    let text = alloc::string::String::from_utf8_lossy(bytes);
+    {
+        let mut serial = crate::serial::SERIAL1.lock();
+        let _ = serial.write_str(&text);
+    }
+    if let Some(console) = crate::console::CONSOLE.lock().as_mut() {
+        let _ = console.write_str(&text);
+    }
+}
+
+fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
+    if fd != 1 && fd != 2 {
+        return errno(EBADF);
+    }
+    let n = (len as usize).min(MAX_WRITE);
+    if n == 0 {
+        return 0;
+    }
+    let mut data = alloc::vec![0u8; n];
+    if !vmm::copy_from_user(&mut data, buf) {
+        return errno(EFAULT);
+    }
+    console_write(&data);
+    n as u64
+}
+
 #[no_mangle]
 extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
+    // `SFMASK` cleared IF on entry because the stub had no stack to
+    // trust. The frame now lives on this thread's own kernel stack, so
+    // interrupts (and with them preemption) can safely come back on:
+    // a syscall may take as long as it likes without stalling the timer.
+    crate::idt::enable_interrupts();
+
     match frame.rax {
+        SYS_WRITE => frame.rax = sys_write(frame.rdi, frame.rsi, frame.rdx),
+        SYS_SCHED_YIELD => {
+            scheduler::yield_now();
+            frame.rax = 0;
+        }
+        SYS_GETPID => frame.rax = scheduler::current_id(),
+        // Never returns: records the status, ends the thread, and the
+        // scheduler frees the process's address space once it's off the CPU.
+        SYS_EXIT => process::exit_current((frame.rdi & 0xff) as i64),
         TEST_SYSCALL_NUM => {
             TEST_ARG.store(frame.rdi, Ordering::SeqCst);
             TEST_DONE.store(true, Ordering::SeqCst);
@@ -199,7 +289,7 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
                 other,
                 frame.rip
             );
-            frame.rax = u64::MAX;
+            frame.rax = errno(ENOSYS);
         }
     }
 }
@@ -207,7 +297,7 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
 /// Drop from ring 0 into ring 3 at `entry`, running on `user_rsp`. Never
 /// returns to the caller: either the user code eventually `syscall`s
 /// into a handler that exits the thread, or (self-test only) it spins.
-fn enter_user_mode(entry: u64, user_rsp: u64) -> ! {
+pub fn enter_user_mode(entry: u64, user_rsp: u64) -> ! {
     unsafe {
         enter_user_mode_asm(
             entry,

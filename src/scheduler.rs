@@ -25,6 +25,11 @@
 //! - A thread that exits can't free the stack it is still running on, so
 //!   it parks itself on a zombie list and whichever thread runs next
 //!   reaps it (`finish_switch`).
+//! - A thread may own a user address space (`spawn_user`). The scheduler
+//!   loads the next thread's page tables into CR3 on every switch
+//!   (kernel threads run on the kernel's own tables) and the address
+//!   space is torn down together with the thread when it is reaped -- by
+//!   then CR3 is guaranteed to point somewhere else.
 
 #![allow(dead_code)]
 
@@ -98,6 +103,14 @@ struct Thread {
     /// Uptime (ms) at which a sleeping thread becomes runnable again.
     wake_at: u64,
     is_idle: bool,
+    /// The user address space this thread runs in; `None` for kernel
+    /// threads, which run on the kernel's own page tables. Owned by the
+    /// thread: dropping it (in `free_thread`) frees every page the
+    /// process had mapped.
+    aspace: Option<vmm::AddressSpace>,
+    /// Where `user_thread_main` drops into ring 3, and on which stack.
+    user_entry: u64,
+    user_rsp: u64,
 }
 
 struct Scheduler {
@@ -216,10 +229,17 @@ fn create_thread(name: &'static str, entry: fn(), is_idle: bool) -> Option<Box<T
         stack_slot: Some(slot),
         wake_at: 0,
         is_idle,
+        aspace: None,
+        user_entry: 0,
+        user_rsp: 0,
     }))
 }
 
-/// Release a dead thread's stack and bookkeeping.
+/// Release a dead thread's stack and bookkeeping. If the thread owned a
+/// user address space, dropping `t` tears that down too. That is safe
+/// here: this runs on some *other* thread (see `finish_switch`), and
+/// `reschedule` had already loaded that thread's page tables into CR3,
+/// so the dying thread's PML4 is not in use.
 fn free_thread(t: Box<Thread>) {
     if let Some(slot) = t.stack_slot {
         unmap_stack(slot_base(slot), STACK_PAGES);
@@ -313,6 +333,18 @@ fn reschedule(how: Next<'_>) {
         if let Some(slot) = next.stack_slot {
             crate::gdt::set_kernel_stack(slot_base(slot) + (1 + STACK_PAGES) * PAGE_SIZE);
         }
+        // Likewise for the page tables: a user thread runs in its own
+        // address space, everything else on the kernel's. Every address
+        // space shares the kernel half, so the kernel stacks, the heap
+        // and this very code stay mapped across the write. Skipping it
+        // when nothing changes avoids a pointless TLB flush.
+        let want_cr3 = match next.aspace.as_ref() {
+            Some(a) => a.phys(),
+            None => vmm::kernel_cr3(),
+        };
+        if want_cr3 != 0 && want_cr3 != vmm::current_cr3() {
+            unsafe { vmm::write_cr3(want_cr3) };
+        }
         s.current = Some(next);
 
         if cur_ptr == next_ptr {
@@ -367,6 +399,9 @@ pub fn init() {
         stack_slot: None,
         wake_at: 0,
         is_idle: false,
+        aspace: None,
+        user_entry: 0,
+        user_rsp: 0,
     });
     {
         let mut guard = SCHED.lock();
@@ -387,6 +422,40 @@ pub fn init() {
 /// Start a new kernel thread running `entry`. Returns its id.
 pub fn spawn(name: &'static str, entry: fn()) -> Option<u64> {
     let t = create_thread(name, entry, false)?;
+    let id = t.id;
+    SCHED.lock().ready.push_back(t);
+    Some(id)
+}
+
+/// First (and only) kernel-side code a user thread runs: read where the
+/// process wants to start and drop into ring 3 there. Never returns --
+/// the thread ends through `sys_exit`, or is killed by a user-mode fault.
+fn user_thread_main() {
+    let (entry, rsp) = {
+        let s = SCHED.lock();
+        let t = s.current.as_ref().expect("scheduler: no current thread");
+        (t.user_entry, t.user_rsp)
+    };
+    // The lock guard is gone before the jump: nothing may be held while
+    // in user mode.
+    crate::syscall::enter_user_mode(entry, rsp)
+}
+
+/// Start a new thread that runs `entry` in ring 3, on stack pointer
+/// `user_rsp`, inside `aspace`. The thread takes ownership of the
+/// address space and frees it when it is reaped. Returns its id, or
+/// `None` (dropping, and thereby freeing, `aspace`) if no thread could
+/// be created.
+pub fn spawn_user(
+    name: &'static str,
+    aspace: vmm::AddressSpace,
+    entry: u64,
+    user_rsp: u64,
+) -> Option<u64> {
+    let mut t = create_thread(name, user_thread_main, false)?;
+    t.aspace = Some(aspace);
+    t.user_entry = entry;
+    t.user_rsp = user_rsp;
     let id = t.id;
     SCHED.lock().ready.push_back(t);
     Some(id)

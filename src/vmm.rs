@@ -3,6 +3,7 @@
 use core::arch::asm;
 use core::fmt;
 use core::ptr::addr_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use limine::request::KernelAddressRequest;
 use crate::pmm::{self, PAGE_SIZE};
@@ -89,6 +90,16 @@ struct Vmm {
 unsafe impl Send for Vmm {}
 
 static VMM: IrqMutex<Option<Vmm>> = IrqMutex::new(None);
+
+/// Physical address of the kernel's own PML4 (the one `init` loads).
+/// Kept outside the `VMM` lock so the scheduler can read it on every
+/// context switch without touching that lock. Zero until `init` ran.
+static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
+
+/// First address past the user half of the address space. Every
+/// canonical address below this is user space, everything at or above
+/// `0xffff_8000_0000_0000` is kernel space.
+pub const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
 
 struct Size(u64);
 
@@ -281,13 +292,24 @@ pub fn is_active() -> bool {
     VMM.lock().is_some()
 }
 
-unsafe fn read_cr3() -> u64 {
+/// Physical address of the kernel's own PML4, or 0 before `init`.
+pub fn kernel_cr3() -> u64 {
+    KERNEL_CR3.load(Ordering::Acquire)
+}
+
+/// Physical address of the PML4 the CPU is translating through right
+/// now (CR3 with the PWT/PCD flag bits masked off).
+pub fn current_cr3() -> u64 {
+    unsafe { read_cr3() & ADDR_MASK }
+}
+
+pub unsafe fn read_cr3() -> u64 {
     let v: u64;
     asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags));
     v
 }
 
-unsafe fn write_cr3(phys: u64) {
+pub unsafe fn write_cr3(phys: u64) {
     asm!("mov cr3, {}", in(reg) phys, options(nostack, preserves_flags));
 }
 
@@ -475,6 +497,7 @@ pub fn init() {
     unsafe { write_cr3(pml4_phys) };
 
     *VMM.lock() = Some(Vmm { pml4_phys });
+    KERNEL_CR3.store(pml4_phys, Ordering::Release);
 
     log_ok!(
         "VMM",
@@ -626,6 +649,78 @@ unsafe fn free_pt(phys: u64) {
         }
     }
     pmm::free_frame(phys);
+}
+
+/// Software walk for a ring-3 read of `virt` through `pml4_phys`.
+///
+/// Succeeds only for a 4 KiB mapping that is user-accessible at *every*
+/// level (the CPU ANDs the U/S bit across the whole walk). Huge pages
+/// are refused: nothing in the user half is ever mapped that way, so
+/// seeing one there means something is wrong. Returns the physical
+/// address of the exact byte, like `walk`.
+unsafe fn walk_user(pml4_phys: u64, virt: u64) -> Option<u64> {
+    let pml4 = table_ptr(pml4_phys);
+    let e = (*pml4).0[index(virt, 0)];
+    if e & (PRESENT | USER) != (PRESENT | USER) {
+        return None;
+    }
+    let pdpt = table_ptr(e & ADDR_MASK);
+    let e = (*pdpt).0[index(virt, 1)];
+    if e & (PRESENT | USER) != (PRESENT | USER) || e & HUGE != 0 {
+        return None;
+    }
+    let pd = table_ptr(e & ADDR_MASK);
+    let e = (*pd).0[index(virt, 2)];
+    if e & (PRESENT | USER) != (PRESENT | USER) || e & HUGE != 0 {
+        return None;
+    }
+    let pt = table_ptr(e & ADDR_MASK);
+    let leaf = (*pt).0[index(virt, 3)];
+    if leaf & (PRESENT | USER) != (PRESENT | USER) {
+        return None;
+    }
+    Some((leaf & ADDR_MASK) + (virt & (PAGE_SIZE - 1)))
+}
+
+/// Copy `dst.len()` bytes from the *current* address space's user
+/// memory at `src` into `dst`. Returns `false` (leaving `dst` partly
+/// written) if any part of the range is outside user space or not
+/// mapped user-accessible.
+///
+/// This never dereferences the user pointer: it walks the page tables in
+/// software and reads each page through the kernel's direct map, so a
+/// bad pointer from a process is a clean `false` here instead of a
+/// kernel-mode page fault (which would panic the whole kernel).
+pub fn copy_from_user(dst: &mut [u8], src: u64) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    let Some(end) = src.checked_add(dst.len() as u64) else {
+        return false;
+    };
+    if end > USER_SPACE_END {
+        return false;
+    }
+
+    let pml4 = current_cr3();
+    let mut done = 0usize;
+    while done < dst.len() {
+        let va = src + done as u64;
+        let page_off = (va & (PAGE_SIZE - 1)) as usize;
+        let n = (dst.len() - done).min(PAGE_SIZE as usize - page_off);
+        let Some(phys) = (unsafe { walk_user(pml4, va) }) else {
+            return false;
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pmm::phys_to_virt(phys) as *const u8,
+                dst.as_mut_ptr().add(done),
+                n,
+            );
+        }
+        done += n;
+    }
+    true
 }
 
 /// Create a new address space for a process: a private, empty lower

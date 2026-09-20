@@ -5,15 +5,18 @@ extern crate alloc;
 
 pub mod blocking;
 pub mod console;
+pub mod elf;
 pub mod framebuffer;
 pub mod gdt;
 pub mod heap;
 pub mod idt;
+pub mod initramfs;
 pub mod logger;
 pub mod panic_screen;
 pub mod pic;
 pub mod pit;
 pub mod pmm;
+pub mod process;
 pub mod scheduler;
 pub mod serial;
 pub mod sync;
@@ -84,7 +87,13 @@ unsafe extern "C" fn _start() -> ! {
 
     vmm::address_space_self_test();
 
-    // TODO: ELF loader + initramfs
+    // The initramfs is a Limine module reached through the direct map, so
+    // this has to come after the VMM is up.
+    initramfs::init();
+    initramfs::self_test();
+
+    process::self_test();
+    process::start_init();
 
     log_ok!("Kernel", "Init", "Initialization complete, handing over to the scheduler");
 
