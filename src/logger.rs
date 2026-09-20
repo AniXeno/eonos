@@ -1,5 +1,3 @@
-//! EonOS logging system with early log buffering for framebuffer playback.
-
 use core::fmt::{self, Write};
 use spin::Mutex;
 
@@ -26,18 +24,16 @@ impl Status {
         }
     }
 
-    /// Colour for the status label.
     pub const fn color(self) -> &'static str {
         match self {
-            Status::Ok => "\x1b[92m",       // bright green
-            Status::Busy => "\x1b[93m",     // bright yellow
-            Status::Fail => "\x1b[91m",     // bright red
-            Status::Critical => "\x1b[97;41m", // white on red
-            Status::Debug => "\x1b[94m",    // bright blue
+            Status::Ok => "\x1b[92m",       
+            Status::Busy => "\x1b[93m",     
+            Status::Fail => "\x1b[91m",     
+            Status::Critical => "\x1b[97;41m", 
+            Status::Debug => "\x1b[94m",   
         }
     }
 
-    /// Colour for the message text itself.
     pub const fn text_color(self) -> &'static str {
         match self {
             Status::Fail | Status::Critical => "\x1b[91m",
@@ -47,7 +43,7 @@ impl Status {
 }
 
 const EARLY_LOG_CAPACITY: usize = 32;
-const MAX_LINE_LEN: usize = 256; // colour escapes take space
+const MAX_LINE_LEN: usize = 256; 
 
 struct LogEntry {
     buf: [u8; MAX_LINE_LEN],
@@ -66,8 +62,6 @@ pub static LOGGER: Mutex<Logger> = Mutex::new(Logger {
     early_count: 0,
 });
 
-/// Write one coloured log line to any sink.
-/// Format: `Module:Function > Output | STATUS` (with ANSI colours if `colors`).
 fn emit<W: Write>(
     w: &mut W,
     colors: bool,
@@ -89,13 +83,11 @@ fn emit<W: Write>(
 
 impl Logger {
     pub fn log(&mut self, module: &str, function: &str, output: fmt::Arguments, status: Status) {
-        // 1. Serial output (colours can be switched off with `use_color`)
         {
             let mut serial = SERIAL1.lock();
             emit(&mut *serial, self.use_color, module, function, output, status);
         }
 
-        // 2. Screen, or the early buffer if the console isn't up yet
         if let Some(console) = CONSOLE.lock().as_mut() {
             emit(console, true, module, function, output, status);
         } else if self.early_count < EARLY_LOG_CAPACITY {
@@ -113,7 +105,6 @@ impl Logger {
                 let entry = &self.early_buffer[i];
                 if let Ok(s) = core::str::from_utf8(&entry.buf[..entry.len]) {
                     let _ = console.write_str(s);
-                    // Guard against an entry that was truncated mid-escape.
                     let _ = console.write_str("\x1b[0m");
                 }
             }

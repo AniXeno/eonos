@@ -1,7 +1,3 @@
-//! Minimal 16550 UART driver (COM1), used as the primary log sink until
-//! the framebuffer console is ready. QEMU forwards COM1 to stdio with
-//! `-serial stdio`, so this is what you'll see in your terminal.
-
 use core::fmt;
 use spin::Mutex;
 
@@ -18,16 +14,15 @@ impl SerialPort {
         Self { port }
     }
 
-    /// Must be called exactly once before use.
     pub fn init(&mut self) {
         unsafe {
-            outb(self.port + 1, 0x00); // Disable interrupts
-            outb(self.port + 3, 0x80); // Enable DLAB
-            outb(self.port + 0, 0x03); // Divisor low byte -> 38400 baud
-            outb(self.port + 1, 0x00); // Divisor high byte
-            outb(self.port + 3, 0x03); // 8 bits, no parity, one stop bit
-            outb(self.port + 2, 0xC7); // Enable FIFO, clear, 14-byte threshold
-            outb(self.port + 4, 0x0B); // IRQs enabled, RTS/DSR set
+            outb(self.port + 1, 0x00); 
+            outb(self.port + 3, 0x80); 
+            outb(self.port + 0, 0x03); 
+            outb(self.port + 1, 0x00); 
+            outb(self.port + 3, 0x03); 
+            outb(self.port + 2, 0xC7); 
+            outb(self.port + 4, 0x0B); 
         }
     }
 

@@ -1,30 +1,3 @@
-//! Virtual memory manager: kernel-owned 4-level x86_64 paging.
-//!
-//! Limine hands the kernel a working set of page tables to boot with, but
-//! they're Limine's, living in `BOOTLOADER_RECLAIMABLE` memory. This module
-//! builds a fresh PML4 and switches `CR3` to it, so the kernel is no longer
-//! borrowing the bootloader's mappings.
-//!
-//! Three things get mapped into the new tables before the switch:
-//!
-//! * The kernel image itself, at the physical/virtual base Limine reports,
-//!   with per-section permissions: `.text` is read+execute, `.rodata` is
-//!   read-only, `.data`/`.bss` are read+write, and everything except
-//!   `.text` is marked no-execute (NX).
-//! * All physical memory the PMM manages (usable RAM plus still-reclaimable
-//!   bootloader memory), direct-mapped 1:1 at `phys + hhdm_offset` using
-//!   2 MiB pages. This matches Limine's own HHDM, so nothing that already
-//!   holds an HHDM pointer (e.g. `pmm::phys_to_virt`) needs to change.
-//! * The framebuffer's physical range, at the same HHDM-relative address
-//!   Limine already gave `framebuffer::FbInfo::addr`, so the console and
-//!   framebuffer code keep working unmodified across the switch.
-//!
-//! `BOOTLOADER_RECLAIMABLE` memory (Limine's own page tables, GDT, and the
-//! stack we boot on) is covered by the direct-map range above, so it stays
-//! readable/writable until `pmm::reclaim_bootloader_memory` hands it to the
-//! frame allocator. Nothing here reads Limine's page tables directly once
-//! `CR3` has been switched.
-
 #![allow(dead_code)]
 
 use core::arch::asm;
@@ -37,30 +10,19 @@ use spin::Mutex;
 use crate::pmm::{self, PAGE_SIZE};
 use crate::{log_debug, log_fail, log_ok};
 
-// ---------------------------------------------------------------------------
-// Page table entry flags
-// ---------------------------------------------------------------------------
-
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
-const HUGE: u64 = 1 << 7; // PS bit: valid on PDPT/PD entries only
+const HUGE: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
 
-/// Read+execute, not writable. For `.text`.
 pub const KERNEL_RX: u64 = PRESENT;
-/// Read-only, not executable. For `.rodata`.
 pub const KERNEL_RO: u64 = PRESENT | NO_EXECUTE;
-/// Read+write, not executable. For `.data`/`.bss`, the direct map, MMIO.
 pub const KERNEL_RW: u64 = PRESENT | WRITABLE | NO_EXECUTE;
 
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const ENTRIES: usize = 512;
 const HUGE_2M: u64 = 0x20_0000;
 
-/// A scratch virtual address used only by [`self_test`]. Chosen well past
-/// the kernel image (which is a few MiB at most) but still inside the
-/// canonical top-2GiB region the kernel lives in, so it needs no mapping
-/// beyond what `map_page` creates on demand.
 const SELF_TEST_VIRT: u64 = 0xffff_ffff_c000_0000;
 
 extern "C" {
@@ -91,7 +53,6 @@ unsafe impl Send for Vmm {}
 
 static VMM: Mutex<Option<Vmm>> = Mutex::new(None);
 
-/// Human-readable size for log lines.
 struct Size(u64);
 
 impl fmt::Display for Size {
@@ -112,23 +73,15 @@ const fn align_down(v: u64, a: u64) -> u64 {
     v & !(a - 1)
 }
 
-// ---------------------------------------------------------------------------
-// Table walking
-// ---------------------------------------------------------------------------
-
 fn table_ptr(phys: u64) -> *mut Table {
     pmm::phys_to_virt(phys) as *mut Table
 }
 
-/// Index into the table at `level` (0 = PML4 ... 3 = PT) for `virt`.
 fn index(virt: u64, level: usize) -> usize {
     ((virt >> (39 - level * 9)) & 0x1FF) as usize
 }
 
-/// Return the child table at `index`, allocating and zeroing a fresh frame
-/// for it if the slot is empty. Intermediate entries are always
-/// present+writable; the *leaf* entry's own flags are what actually
-/// restrict a mapping, so this never widens permissions.
+
 unsafe fn child_table(parent: *mut Table, idx: usize) -> *mut Table {
     let entry = (*parent).0[idx];
     if entry & PRESENT != 0 {
@@ -139,7 +92,6 @@ unsafe fn child_table(parent: *mut Table, idx: usize) -> *mut Table {
     table_ptr(phys)
 }
 
-/// Map one 4 KiB page, creating page tables as needed.
 unsafe fn map4k(pml4: *mut Table, virt: u64, phys: u64, flags: u64) {
     let pdpt = child_table(pml4, index(virt, 0));
     let pd = child_table(pdpt, index(virt, 1));
@@ -147,27 +99,18 @@ unsafe fn map4k(pml4: *mut Table, virt: u64, phys: u64, flags: u64) {
     (*pt).0[index(virt, 3)] = (phys & ADDR_MASK) | flags | PRESENT;
 }
 
-/// Map one 2 MiB huge page (at the PD level), creating tables as needed.
 unsafe fn map2m(pml4: *mut Table, virt: u64, phys: u64, flags: u64) {
     let pdpt = child_table(pml4, index(virt, 0));
     let pd = child_table(pdpt, index(virt, 1));
     (*pd).0[index(virt, 2)] = (phys & ADDR_MASK) | flags | PRESENT | HUGE;
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Map one 4 KiB page in the kernel's page tables. No-op if the VMM hasn't
-/// been initialised yet.
 pub fn map_page(virt: u64, phys: u64, flags: u64) {
     let mut guard = VMM.lock();
     let Some(vmm) = guard.as_mut() else { return };
     unsafe { map4k(table_ptr(vmm.pml4_phys), virt, phys, flags) };
 }
 
-/// Remove a single 4 KiB mapping (leaves any huge-page mapping covering
-/// `virt` untouched -- this only tears down 4 KiB leaves).
 pub fn unmap_page(virt: u64) {
     let guard = VMM.lock();
     let Some(vmm) = guard.as_ref() else { return };
@@ -193,7 +136,6 @@ pub fn unmap_page(virt: u64) {
     }
 }
 
-/// Translate a virtual address to its mapped physical address, if any.
 pub fn translate(virt: u64) -> Option<u64> {
     let guard = VMM.lock();
     let vmm = guard.as_ref()?;
@@ -226,14 +168,9 @@ pub fn translate(virt: u64) -> Option<u64> {
     }
 }
 
-/// Whether the VMM has switched to its own page tables yet.
 pub fn is_active() -> bool {
     VMM.lock().is_some()
 }
-
-// ---------------------------------------------------------------------------
-// CPU helpers
-// ---------------------------------------------------------------------------
 
 unsafe fn read_cr3() -> u64 {
     let v: u64;
@@ -249,9 +186,6 @@ unsafe fn invlpg(virt: u64) {
     asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
 }
 
-/// Set `EFER.NXE`. Must happen before any page table entry has `NO_EXECUTE`
-/// set, or using that entry raises a fault: the bit is simply reserved
-/// (and therefore illegal to set) until the CPU is told to honour it.
 unsafe fn enable_nxe() {
     const EFER: u32 = 0xC000_0080;
     let lo: u32;
@@ -262,10 +196,6 @@ unsafe fn enable_nxe() {
     let hi = (value >> 32) as u32;
     asm!("wrmsr", in("ecx") EFER, in("eax") lo, in("edx") hi, options(nomem, nostack, preserves_flags));
 }
-
-// ---------------------------------------------------------------------------
-// Initialisation
-// ---------------------------------------------------------------------------
 
 unsafe fn map_kernel_sections(pml4: *mut Table, kernel_phys: u64, kernel_virt: u64) {
     let to_phys = |v: u64| kernel_phys + (v - kernel_virt);
@@ -321,16 +251,12 @@ pub fn init() {
     let pml4 = table_ptr(pml4_phys);
 
     unsafe {
-        // 1. Direct-map all physical memory the PMM manages at
-        //    `phys + hhdm`, using 2 MiB pages to keep table count small.
         let mut phys = 0u64;
         while phys < phys_top {
             map2m(pml4, hhdm + phys, phys, KERNEL_RW);
             phys += HUGE_2M;
         }
 
-        // 2. Framebuffer MMIO: same HHDM-relative address Limine already
-        //    used, so `FbInfo::addr` stays valid across the CR3 switch.
         if let Some(fb) = crate::framebuffer::FRAMEBUFFER.lock().as_ref() {
             if let Some(fb_phys) = (fb.addr as u64).checked_sub(hhdm) {
                 let start = align_down(fb_phys, PAGE_SIZE);
@@ -343,7 +269,6 @@ pub fn init() {
             }
         }
 
-        // 3. Kernel image, per-section permissions.
         map_kernel_sections(pml4, kernel_phys, kernel_virt);
     }
 
@@ -369,7 +294,6 @@ pub fn init() {
     );
 }
 
-/// Map a scratch page, write through it, translate it, then unmap it.
 pub fn self_test() {
     if !is_active() {
         log_fail!("VMM", "SelfTest", "VMM not initialized");

@@ -1,26 +1,3 @@
-//! Physical memory manager: a bitmap allocator that hands out 4 KiB frames.
-//!
-//! ## What Limine still owns (and how this file respects it)
-//!
-//! Limine's memory map tells us what every physical range is. We only ever
-//! allocate from `USABLE` ranges. Everything else is left alone:
-//!
-//! * `BOOTLOADER_RECLAIMABLE` holds Limine's page tables (CR3 still points
-//!   there), the stack we are running on, and the memory-map response itself.
-//!   It must stay untouched until the VMM has switched to our own page tables
-//!   and we are on our own stack. Only then may
-//!   [`reclaim_bootloader_memory`] hand it to the allocator. To make that safe
-//!   we copy the memory map into our own storage during `init`, so we never
-//!   need to read Limine's structures again afterwards.
-//! * `KERNEL_AND_MODULES`, `FRAMEBUFFER`, `ACPI_*`, `RESERVED`, `BAD_MEMORY`
-//!   are never allocated.
-//! * The first 1 MiB is never handed out (legacy/BIOS area, future SMP
-//!   trampoline, DMA-below-1M users).
-//!
-//! Limine also provides the higher-half direct map (HHDM): all usable RAM is
-//! mapped at `phys + hhdm_offset`, which is how we touch physical frames
-//! (the bitmap itself, zeroing frames) before we have a VMM.
-
 #![allow(dead_code)]
 
 use core::fmt;
@@ -34,10 +11,7 @@ use crate::{log_debug, log_fail, log_ok};
 
 pub const PAGE_SIZE: u64 = 4096;
 
-/// Never allocate below this physical address.
 const MIN_ALLOC_ADDR: u64 = 0x10_0000;
-
-/// Max memory-map entries we keep a copy of.
 const MAX_REGIONS: usize = 128;
 
 #[used]
@@ -49,10 +23,6 @@ static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
-
-// ---------------------------------------------------------------------------
-// Our own copy of the memory map (the only place Limine's map types are used)
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -120,7 +90,6 @@ impl Region {
     };
 }
 
-/// Human-readable size for log lines.
 struct Size(u64);
 
 impl fmt::Display for Size {
@@ -141,10 +110,6 @@ const fn align_down(v: u64, a: u64) -> u64 {
     v & !(a - 1)
 }
 
-// ---------------------------------------------------------------------------
-// Bitmap helpers. Bit set = frame in use / unavailable, bit clear = free.
-// ---------------------------------------------------------------------------
-
 unsafe fn test_bit(bm: *const u64, i: usize) -> bool {
     *bm.add(i / 64) & (1u64 << (i % 64)) != 0
 }
@@ -157,9 +122,7 @@ unsafe fn clear_bit(bm: *mut u64, i: usize) {
     *bm.add(i / 64) &= !(1u64 << (i % 64));
 }
 
-/// Mark `count` frames starting at `first` as used (`true`) or free (`false`).
 unsafe fn fill_range(bm: *mut u64, mut first: usize, mut count: usize, used: bool) {
-    // Head: bit by bit until word aligned
     while count > 0 && first % 64 != 0 {
         if used {
             set_bit(bm, first);
@@ -169,13 +132,11 @@ unsafe fn fill_range(bm: *mut u64, mut first: usize, mut count: usize, used: boo
         first += 1;
         count -= 1;
     }
-    // Body: whole words
     while count >= 64 {
         *bm.add(first / 64) = if used { !0u64 } else { 0u64 };
         first += 64;
         count -= 64;
     }
-    // Tail
     while count > 0 {
         if used {
             set_bit(bm, first);
@@ -186,10 +147,6 @@ unsafe fn fill_range(bm: *mut u64, mut first: usize, mut count: usize, used: boo
         count -= 1;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Allocator state
-// ---------------------------------------------------------------------------
 
 enum FreeError {
     NotInitialized,
@@ -212,14 +169,10 @@ impl FreeError {
 struct Pmm {
     bitmap: *mut u64,
     bitmap_words: usize,
-    /// Frames covered by the bitmap (frame 0 .. total_frames).
     total_frames: usize,
     free_frames: usize,
-    /// Frames that were free right after init (excludes the bitmap itself).
     usable_frames: usize,
-    /// Word index where the next allocation search starts.
     next_hint: usize,
-    /// Our copy of Limine's memory map.
     regions: [Region; MAX_REGIONS],
     region_count: usize,
 }
@@ -236,7 +189,7 @@ impl Pmm {
             let w = (self.next_hint + n) % words;
             let word = unsafe { *self.bitmap.add(w) };
             if word != !0u64 {
-                let bit = (!word).trailing_zeros() as usize; // First clear bit
+                let bit = (!word).trailing_zeros() as usize;
                 let frame = w * 64 + bit;
                 unsafe { *self.bitmap.add(w) = word | (1u64 << bit) };
                 self.free_frames -= 1;
@@ -247,7 +200,6 @@ impl Pmm {
         None
     }
 
-    /// First-fit search for `count` physically contiguous free frames.
     fn alloc_contiguous(&mut self, count: usize) -> Option<u64> {
         if count == 0 || count > self.free_frames {
             return None;
@@ -256,7 +208,6 @@ impl Pmm {
         let mut start = 0usize;
         let mut frame = 0usize;
         while frame < self.total_frames {
-            // Fast path: skip a whole fully-used word.
             if frame % 64 == 0 && unsafe { *self.bitmap.add(frame / 64) } == !0u64 {
                 run = 0;
                 frame += 64;
@@ -292,7 +243,6 @@ impl Pmm {
         if end > self.total_frames {
             return Err(FreeError::OutOfRange);
         }
-        // Check everything first so a bad call changes nothing.
         for f in first..end {            if !unsafe { test_bit(self.bitmap, f) } {
                 return Err(FreeError::NotAllocated);
             }
@@ -306,32 +256,24 @@ impl Pmm {
 
 static PMM: Mutex<Option<Pmm>> = Mutex::new(None);
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 pub fn hhdm_offset() -> u64 {
     HHDM_OFFSET.load(Ordering::Relaxed)
 }
 
-/// Virtual address (in the Limine HHDM) of a physical address.
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
     (phys + hhdm_offset()) as *mut u8
 }
 
-/// Allocate one 4 KiB frame. Returns its physical address.
 pub fn alloc_frame() -> Option<u64> {
     PMM.lock().as_mut()?.alloc_one()
 }
 
-/// Allocate one frame and zero it.
 pub fn alloc_frame_zeroed() -> Option<u64> {
     let phys = alloc_frame()?;
     unsafe { ptr::write_bytes(phys_to_virt(phys), 0, PAGE_SIZE as usize) };
     Some(phys)
 }
 
-/// Allocate `count` physically contiguous frames.
 pub fn alloc_contiguous(count: usize) -> Option<u64> {
     let mut guard = PMM.lock();
     let pmm = guard.as_mut()?;
@@ -346,8 +288,6 @@ pub fn free_frame(phys: u64) {
     free_frames(phys, 1);
 }
 
-/// Free `count` frames starting at `phys`. Invalid or double frees are
-/// logged and ignored. Only free frames that came from this allocator.
 pub fn free_frames(phys: u64, count: usize) {
     let result = {
         let mut guard = PMM.lock();
@@ -376,11 +316,6 @@ pub fn usable_frame_count() -> usize {
     PMM.lock().as_ref().map(|p| p.usable_frames).unwrap_or(0)
 }
 
-/// Highest physical address the PMM knows about (i.e. the exclusive end of
-/// the frame bitmap). The VMM direct-maps physical memory up to this
-/// address, so it covers usable RAM *and* still-reclaimable bootloader
-/// memory, but not MMIO regions like the framebuffer, which live elsewhere
-/// and are mapped separately.
 pub fn phys_top() -> u64 {
     PMM.lock()
         .as_ref()
@@ -388,16 +323,6 @@ pub fn phys_top() -> u64 {
         .unwrap_or(0)
 }
 
-/// Hand Limine's bootloader-reclaimable memory to the allocator.
-///
-/// # Safety
-/// Only call this once **all** of these are true:
-/// * the kernel runs on its own page tables (CR3 no longer points into
-///   bootloader-reclaimable memory),
-/// * the kernel runs on its own stack,
-/// * nothing will read Limine's response structures any more.
-///
-/// Uses the copy of the memory map saved by `init`, not Limine's.
 pub unsafe fn reclaim_bootloader_memory() -> usize {
     let reclaimed = {        let mut guard = PMM.lock();
         let Some(pmm) = guard.as_mut() else { return 0 };
@@ -428,10 +353,6 @@ pub unsafe fn reclaim_bootloader_memory() -> usize {
     reclaimed
 }
 
-// ---------------------------------------------------------------------------
-// Initialisation
-// ---------------------------------------------------------------------------
-
 pub fn init() {
     let Some(mm_response) = MEMORY_MAP_REQUEST.get_response() else {
         log_fail!("PMM", "Init", "Limine gave us no memory map");
@@ -446,7 +367,6 @@ pub fn init() {
     HHDM_OFFSET.store(hhdm, Ordering::Relaxed);
     log_debug!("PMM", "Init", "HHDM offset {:#018x}", hhdm);
 
-    // 1. Copy Limine's memory map into our own storage.
     let mut regions = [Region::EMPTY; MAX_REGIONS];
     let mut count = 0usize;
     for entry in mm_response.entries() {        if count == MAX_REGIONS {
@@ -466,9 +386,6 @@ pub fn init() {
         count += 1;
     }
 
-    // 2. Print the map and find the highest address we may ever manage.
-    //    Usable AND bootloader-reclaimable memory must fit in the bitmap,
-    //    because the latter becomes allocatable after reclaim.
     let mut highest = 0u64;
     let mut reclaim_bytes = 0u64;
     for r in &regions[..count] {        log_debug!(
@@ -495,13 +412,11 @@ pub fn init() {
         return;
     }
 
-    // 3. Size the bitmap: one bit per 4 KiB frame from address 0 to `highest`.
     let total_frames = (highest / PAGE_SIZE) as usize;
     let bitmap_words = (total_frames + 63) / 64;
     let bitmap_bytes = bitmap_words as u64 * 8;
     let bitmap_frames = align_up(bitmap_bytes, PAGE_SIZE) / PAGE_SIZE;
 
-    // 4. Put the bitmap in the first usable region (above 1 MiB) that fits it.
     let mut bitmap_phys = 0u64;
     for r in &regions[..count] {        if r.kind != Kind::Usable {
             continue;
@@ -526,7 +441,6 @@ pub fn init() {
 
     let bitmap = (bitmap_phys + hhdm) as *mut u64;
 
-    // 5. Everything starts "used"; free only the usable ranges.
     let mut free_frames = 0usize;
     unsafe {
         ptr::write_bytes(bitmap as *mut u8, 0xFF, bitmap_words * 8);
@@ -541,7 +455,6 @@ pub fn init() {
                 free_frames += n;
             }
         }
-        // The bitmap lives inside usable memory: mark its own frames used.
         fill_range(
             bitmap,
             (bitmap_phys / PAGE_SIZE) as usize,
@@ -580,7 +493,6 @@ pub fn init() {
     );
 }
 
-/// Allocate, use, free and re-check a few frames.
 pub fn self_test() {
     let before = free_frame_count();
     if before == 0 {
@@ -609,7 +521,6 @@ pub fn self_test() {
         return;
     }
 
-    // The two frames must be independent memory, reachable through the HHDM.
     unsafe {
         let pa = phys_to_virt(a) as *mut u64;
         let pb = phys_to_virt(b) as *mut u64;
@@ -628,7 +539,6 @@ pub fn self_test() {
             return;
         }
 
-        // Dirty a whole frame so the zeroing test below is meaningful.
         ptr::write_bytes(phys_to_virt(a), 0xAA, PAGE_SIZE as usize);
     }
 

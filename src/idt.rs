@@ -1,13 +1,3 @@
-//! Interrupt Descriptor Table + CPU exception handling.
-//!
-//! Every exception vector (0-31) gets a small assembly stub that normalises
-//! the stack (pushes a dummy error code where the CPU doesn't), pushes the
-//! vector number and all general-purpose registers, then calls
-//! `exception_handler` with a pointer to an `InterruptFrame`.
-//!
-//! Fatal exceptions print a full register dump to the screen and serial port
-//! and halt. #BP (int3) is handled and returns, which makes a handy self-test.
-
 use core::fmt::Write;
 use core::ptr::{addr_of, addr_of_mut};
 
@@ -15,7 +5,7 @@ use crate::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
 use crate::{log_critical, log_debug, log_ok};
 
 const IDT_ENTRIES: usize = 256;
-const GATE_INTERRUPT: u8 = 0x8E; // present, DPL 0, 64-bit interrupt gate
+const GATE_INTERRUPT: u8 = 0x8E;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -61,7 +51,6 @@ struct Idtr {
 
 static mut IDT: [Entry; IDT_ENTRIES] = [Entry::MISSING; IDT_ENTRIES];
 
-/// Registers as laid out on the stack by the assembly stubs (lowest address first).
 #[repr(C)]
 pub struct InterruptFrame {
     pub r15: u64,
@@ -81,7 +70,7 @@ pub struct InterruptFrame {
     pub rax: u64,
     pub vector: u64,
     pub error_code: u64,
-    // pushed by the CPU:
+
     pub rip: u64,
     pub cs: u64,
     pub rflags: u64,
@@ -123,10 +112,6 @@ const EXCEPTION_NAMES: [&str; 32] = [
     "Security Exception (#SX)",
     "Reserved",
 ];
-
-// ---------------------------------------------------------------------------
-// Assembly stubs
-// ---------------------------------------------------------------------------
 
 core::arch::global_asm!(r#"
 .macro isr_noerr num
@@ -256,10 +241,6 @@ extern "C" {
     static isr_stub_table: [u64; 32];
 }
 
-// ---------------------------------------------------------------------------
-// Rust side
-// ---------------------------------------------------------------------------
-
 pub fn init() {
     unsafe {
         let idt = addr_of_mut!(IDT) as *mut Entry;
@@ -308,8 +289,6 @@ fn read_cr3() -> u64 {
 }
 
 fn fatal(frame: &InterruptFrame) -> ! {
-    // The fault may have happened while one of these locks was held (e.g. in
-    // the middle of a log call). We're never returning, so break them open.
     crate::panic_screen::force_unlock_all();
 
     let name = EXCEPTION_NAMES
@@ -392,8 +371,6 @@ fn fatal(frame: &InterruptFrame) -> ! {
         frame.r15
     );
 
-    // Full register dump above already went to serial (and the console, if
-    // it was up); this is the clean summary left on screen when we halt.
     let vector = frame.vector;
     let error_code = frame.error_code;
     let rip = frame.rip;
