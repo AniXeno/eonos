@@ -303,6 +303,16 @@ fn reschedule(how: Next<'_>) {
         };
         let next_ptr: *mut Thread = &mut *next;
         let next_rsp = next.rsp;
+        // Whichever thread runs next, point TSS.rsp0 (and its `syscall`
+        // mirror) at the top of *its* kernel stack: that's where the CPU
+        // must land if this thread later traps into ring 0, whether via
+        // a hardware interrupt/exception taken while it's running user
+        // code, or via `syscall`. The boot thread has no dedicated slot
+        // (it runs on Limine's stack) and isn't expected to run user
+        // code, so it's simply left with whatever rsp0 was set before.
+        if let Some(slot) = next.stack_slot {
+            crate::gdt::set_kernel_stack(slot_base(slot) + (1 + STACK_PAGES) * PAGE_SIZE);
+        }
         s.current = Some(next);
 
         if cur_ptr == next_ptr {

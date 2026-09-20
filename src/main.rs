@@ -17,6 +17,7 @@ pub mod pmm;
 pub mod scheduler;
 pub mod serial;
 pub mod sync;
+pub mod syscall;
 pub mod vmm;
 
 use core::fmt::Write;
@@ -78,7 +79,10 @@ unsafe extern "C" fn _start() -> ! {
 
     blocking::self_test();
 
-    // TODO: processes! (user mode, syscalls, ELF loader)
+    syscall::init();
+    syscall::self_test();
+
+    // TODO: per-process address spaces, ELF loader + initramfs
 
     log_ok!("Kernel", "Init", "Initialization complete, handing over to the scheduler");
 

@@ -11,6 +11,7 @@ use crate::{log_debug, log_fail, log_ok};
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
+const USER: u64 = 1 << 2;
 const PWT: u64 = 1 << 3;
 const HUGE: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
@@ -18,6 +19,17 @@ const NO_EXECUTE: u64 = 1 << 63;
 pub const KERNEL_RX: u64 = PRESENT;
 pub const KERNEL_RO: u64 = PRESENT | NO_EXECUTE;
 pub const KERNEL_RW: u64 = PRESENT | WRITABLE | NO_EXECUTE;
+
+/// Ring-3-accessible leaf flags. The CPU also requires the `USER` bit
+/// set on every page-table level above the leaf, not just the leaf
+/// itself; `child_table`/`split_huge` always set it on the intermediate
+/// tables they create, so any leaf can be made user-accessible just by
+/// picking one of these for its own flags -- a kernel-only leaf
+/// underneath a `USER` intermediate table is still inaccessible from
+/// ring 3, since that check is a logical AND across every level.
+pub const USER_RX: u64 = PRESENT | USER;
+pub const USER_RO: u64 = PRESENT | USER | NO_EXECUTE;
+pub const USER_RW: u64 = PRESENT | WRITABLE | USER | NO_EXECUTE;
 /// Write-combining: for framebuffers and other linear MMIO the CPU may
 /// buffer and merge writes to. See `configure_pat` for how the PWT bit
 /// ends up meaning "write-combining" instead of its default "write-
@@ -111,7 +123,7 @@ unsafe fn child_table(parent: *mut Table, idx: usize) -> *mut Table {
         return table_ptr(entry & ADDR_MASK);
     }
     let phys = pmm::alloc_frame_zeroed().expect("VMM: out of memory for page tables");
-    (*parent).0[idx] = phys | PRESENT | WRITABLE;
+    (*parent).0[idx] = phys | PRESENT | WRITABLE | USER;
     table_ptr(phys)
 }
 
@@ -134,7 +146,7 @@ unsafe fn split_huge(pd: *mut Table, idx: usize) {
     for i in 0..ENTRIES {
         (*pt).0[i] = (base + i as u64 * PAGE_SIZE) | flags;
     }
-    (*pd).0[idx] = phys | PRESENT | WRITABLE;
+    (*pd).0[idx] = phys | PRESENT | WRITABLE | USER;
 }
 
 /// The page table covering `virt`, splitting a 2 MiB page first if that's
