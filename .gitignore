@@ -25,5 +25,7 @@ Thumbs.db
 .vscode/
 .idea/
 limine/
+iso_root/
+
 *.swp
 *.swo

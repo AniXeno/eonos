@@ -47,7 +47,7 @@ unsafe extern "C" fn _start() -> ! {
     log_ok!("IDT", "SelfTest", "Breakpoint exception handled and returned");
 
     // To see the crash screen, temporarily uncomment ONE of these:
-    // core::arch::asm!("ud2");                                  // #UD invalid opcode
+    core::arch::asm!("ud2");                                  // #UD invalid opcode
     // core::ptr::read_volatile(0xffff_8000_dead_0000 as *const u8); // #PF page fault
 
     pmm::init();
