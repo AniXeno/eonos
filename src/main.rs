@@ -42,12 +42,11 @@ unsafe extern "C" fn _start() -> ! {
     gdt::init();
     idt::init();
 
-    // Self-test: int3 -> #BP handler -> iretq back to here.
     core::arch::asm!("int3");
     log_ok!("IDT", "SelfTest", "Breakpoint exception handled and returned");
 
-    // To see the crash screen, temporarily uncomment ONE of these:
-    core::arch::asm!("ud2");                                  // #UD invalid opcode
+    // Kernel Exceptions!
+    // core::arch::asm!("ud2");                                  // #UD invalid opcode
     // core::ptr::read_volatile(0xffff_8000_dead_0000 as *const u8); // #PF page fault
 
     pmm::init();
@@ -57,8 +56,6 @@ unsafe extern "C" fn _start() -> ! {
     vmm::self_test();
 
     // TODO: heap allocator, then scheduler/processes go here.
-    // NOTE: pmm::reclaim_bootloader_memory() must stay uncalled until the
-    // kernel also runs on its own stack, not just its own page tables.
 
     log_ok!("Kernel", "Init", "Initialization complete, halting");
 

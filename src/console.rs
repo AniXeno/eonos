@@ -1,19 +1,11 @@
-//! Framebuffer text console.
-//!
-//! * Glyphs come from a PSF1/PSF2 bitmap font embedded from `font.psf`
-//!   (any size; swap the file and rebuild to change the look).
-//! * Colour is controlled with ANSI SGR escapes (`ESC [ ... m`), so the same
-//!   formatted text can go to both the serial port and the screen.
-
 use core::fmt;
 use spin::Mutex;
 
 use crate::framebuffer::FbInfo;
 
-/// The console font. Must be an *uncompressed* PSF1 or PSF2 file.
 static FONT_DATA: &[u8] = include_bytes!("../font.psf");
 
-/// 16-colour palette (0x00RRGGBB): 0-7 normal, 8-15 bright. "One Dark"-ish.
+
 const PALETTE: [u32; 16] = [
     0x001B1F27, 0x00E06C75, 0x0098C379, 0x00E5C07B, // black red green yellow
     0x0061AFEF, 0x00C678DD, 0x0056B6C2, 0x00ABB2BF, // blue magenta cyan white
@@ -76,8 +68,6 @@ impl Font {
         })
     }
 
-    /// Bitmap for `ch`. Glyph N is codepoint N (true for ASCII in every
-    /// common PSF); anything the font lacks falls back to '?'.
     fn glyph(&self, ch: char) -> &'static [u8] {
         let mut idx = ch as usize;
         if idx >= self.num_glyphs {
