@@ -51,6 +51,16 @@ const PAT_HUGE: u64 = 1 << 12;
 const PAT_4K: u64 = 1 << 7;
 
 const SELF_TEST_VIRT: u64 = 0xffff_ffff_c000_0000;
+/// An arbitrary, page-aligned user-space address, used only to test
+/// mapping into an `AddressSpace`'s private half. Nothing else uses the
+/// user half of any address space yet, so any canonical low address
+/// works.
+const SELF_TEST_USER_VIRT: u64 = 0x0000_0000_0010_0000;
+
+/// PML4 index at which canonical higher-half addresses (0xffff_8000_0000_0000
+/// and up) begin. Every kernel mapping lives at or above this index;
+/// every user mapping lives below it.
+const KERNEL_PML4_START: usize = 256;
 
 extern "C" {
     static __kernel_text_start: u8;
@@ -483,6 +493,161 @@ pub fn init() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Per-process address spaces
+// ---------------------------------------------------------------------
+
+/// A process's page tables.
+///
+/// The lower 256 PML4 entries (user space, `0x0000_..` addresses) are
+/// private to this address space. The upper 256 (kernel space) are
+/// copied verbatim from the kernel's own PML4 at creation time: each
+/// copied entry is a pointer to the very same PDPT the kernel itself
+/// uses, not a fresh copy of one. So every address space shares its
+/// kernel half with the kernel and with every other address space --
+/// there is no synchronization to do when the kernel maps or unmaps
+/// something, because there is nothing to keep in sync.
+///
+/// Caveat: this sharing happens at the granularity of whole 512 GiB
+/// PML4 entries, once, at creation time. If the kernel later starts
+/// using a PML4 slot it had never touched before (unlikely -- image,
+/// heap, stacks and HHDM already occupy theirs from `vmm::init`
+/// onward), an address space created before that point would not see
+/// it. Everything below the PML4 (PDPT/PD/PT) is always shared live,
+/// since only the PML4 itself is copied.
+pub struct AddressSpace {
+    pml4_phys: u64,
+}
+
+unsafe impl Send for AddressSpace {}
+
+impl AddressSpace {
+    /// Physical address of this address space's PML4, i.e. the value to
+    /// load into CR3 to make it current.
+    pub fn phys(&self) -> u64 {
+        self.pml4_phys
+    }
+
+    /// Load this address space into CR3, making it the one the CPU
+    /// translates through. The caller is responsible for switching back
+    /// (or into another address space) before this one is dropped, and
+    /// for keeping the `AddressSpace` alive for as long as it's active.
+    pub unsafe fn activate(&self) {
+        write_cr3(self.pml4_phys);
+    }
+
+    /// Map a single 4 KiB page in this address space's private half.
+    /// Only valid for `virt < 0x0000_8000_0000_0000` (user space); use
+    /// the free-standing `vmm::map_page` for kernel addresses instead.
+    pub fn map(&self, virt: u64, phys: u64, flags: u64) {
+        debug_assert!(
+            index_of_top_level(virt) < KERNEL_PML4_START,
+            "AddressSpace::map called with a kernel-half address; use vmm::map_page"
+        );
+        unsafe {
+            map4k(table_ptr(self.pml4_phys), virt, phys, flags);
+            // Only meaningful while this space is the active one, but
+            // harmless (a no-op) otherwise: INVLPG only ever discards a
+            // TLB entry for the current CR3.
+            invlpg(virt);
+        }
+    }
+
+    /// Software page-table walk in this address space, independent of
+    /// which address space is currently active in CR3.
+    pub fn translate(&self, virt: u64) -> Option<u64> {
+        unsafe { walk(self.pml4_phys, virt) }
+    }
+}
+
+impl Drop for AddressSpace {
+    /// Tear down the private (user) half: every page table it owns, and
+    /// every leaf frame still mapped underneath them, then the PML4
+    /// itself. The shared kernel half is never touched -- those PDPTs
+    /// belong to the kernel's own address space and outlive any process.
+    fn drop(&mut self) {
+        unsafe { free_user_half(self.pml4_phys) };
+    }
+}
+
+fn index_of_top_level(virt: u64) -> usize {
+    index(virt, 0)
+}
+
+unsafe fn free_user_half(pml4_phys: u64) {
+    let pml4 = table_ptr(pml4_phys);
+    for i in 0..KERNEL_PML4_START {
+        let e = (*pml4).0[i];
+        if e & PRESENT != 0 {
+            free_pdpt(e & ADDR_MASK);
+        }
+    }
+    pmm::free_frame(pml4_phys);
+}
+
+unsafe fn free_pdpt(phys: u64) {
+    let t = table_ptr(phys);
+    for i in 0..ENTRIES {
+        let e = (*t).0[i];
+        if e & PRESENT == 0 {
+            continue;
+        }
+        if e & HUGE != 0 {
+            pmm::free_frame(e & HUGE_1G_MASK);
+        } else {
+            free_pd(e & ADDR_MASK);
+        }
+    }
+    pmm::free_frame(phys);
+}
+
+unsafe fn free_pd(phys: u64) {
+    let t = table_ptr(phys);
+    for i in 0..ENTRIES {
+        let e = (*t).0[i];
+        if e & PRESENT == 0 {
+            continue;
+        }
+        if e & HUGE != 0 {
+            pmm::free_frame(e & HUGE_2M_MASK);
+        } else {
+            free_pt(e & ADDR_MASK);
+        }
+    }
+    pmm::free_frame(phys);
+}
+
+unsafe fn free_pt(phys: u64) {
+    let t = table_ptr(phys);
+    for i in 0..ENTRIES {
+        let e = (*t).0[i];
+        if e & PRESENT != 0 {
+            pmm::free_frame(e & ADDR_MASK);
+        }
+    }
+    pmm::free_frame(phys);
+}
+
+/// Create a new address space for a process: a private, empty lower
+/// half plus the kernel's upper half, shared as described on
+/// `AddressSpace`. Returns `None` if the kernel VMM isn't initialized
+/// yet or if a physical frame for the new PML4 can't be allocated.
+pub fn create_address_space() -> Option<AddressSpace> {
+    let guard = VMM.lock();
+    let kernel = guard.as_ref()?;
+    let kernel_pml4 = table_ptr(kernel.pml4_phys);
+
+    let pml4_phys = pmm::alloc_frame_zeroed()?;
+    let pml4 = table_ptr(pml4_phys);
+    unsafe {
+        for i in KERNEL_PML4_START..ENTRIES {
+            (*pml4).0[i] = (*kernel_pml4).0[i];
+        }
+    }
+
+    Some(AddressSpace { pml4_phys })
+}
+
 pub fn self_test() {
     if !is_active() {
         log_fail!("VMM", "SelfTest", "VMM not initialized");
@@ -527,4 +692,135 @@ pub fn self_test() {
             SELF_TEST_VIRT
         );
     }
+}
+
+pub fn address_space_self_test() {
+    if !is_active() {
+        log_fail!("VMM", "AddressSpaceSelfTest", "VMM not initialized");
+        return;
+    }
+
+    let frames_before = pmm::free_frame_count();
+
+    let Some(aspace) = create_address_space() else {
+        log_fail!("VMM", "AddressSpaceSelfTest", "create_address_space failed");
+        return;
+    };
+
+    // Lower half must start out completely empty.
+    unsafe {
+        let pml4 = table_ptr(aspace.pml4_phys);
+        for i in 0..KERNEL_PML4_START {
+            if (*pml4).0[i] != 0 {
+                log_fail!(
+                    "VMM",
+                    "AddressSpaceSelfTest",
+                    "User half not empty at PML4[{}]",
+                    i
+                );
+                return;
+            }
+        }
+    }
+
+    // Upper half must be byte-for-byte the kernel's own entries, i.e.
+    // pointers to the exact same PDPTs, not fresh copies.
+    let kernel_matches = {
+        let guard = VMM.lock();
+        let kernel_pml4 = table_ptr(guard.as_ref().unwrap().pml4_phys);
+        let new_pml4 = table_ptr(aspace.pml4_phys);
+        unsafe {
+            (KERNEL_PML4_START..ENTRIES)
+                .all(|i| (*kernel_pml4).0[i] == (*new_pml4).0[i])
+        }
+    };
+    if !kernel_matches {
+        log_fail!(
+            "VMM",
+            "AddressSpaceSelfTest",
+            "Kernel half diverges from the kernel's own PML4"
+        );
+        return;
+    }
+
+    // A software walk through the new address space must already agree
+    // with the kernel's own translation for a kernel address, with no
+    // activation needed -- confirming the sharing is real, not just a
+    // one-time value copy that happened to match.
+    let probe = addr_of!(__kernel_text_start) as u64;
+    if aspace.translate(probe) != translate(probe) {
+        log_fail!(
+            "VMM",
+            "AddressSpaceSelfTest",
+            "New address space disagrees with the kernel on kernel text at {:#x}",
+            probe
+        );
+        return;
+    }
+
+    // Map a page into the new address space's *private* half, through
+    // `AddressSpace::map` (not the free-standing `map_page`, which only
+    // ever touches the kernel VMM's own PML4).
+    let Some(user_phys) = pmm::alloc_frame() else {
+        log_fail!("VMM", "AddressSpaceSelfTest", "No free frame to test with");
+        return;
+    };
+    aspace.map(SELF_TEST_USER_VIRT, user_phys, USER_RW);
+
+    // Actually switch into it: if the kernel half weren't really shared,
+    // the very next instruction fetch after loading CR3 would triple
+    // fault the machine instead of returning here.
+    let old_cr3 = unsafe { read_cr3() };
+    unsafe { aspace.activate() };
+
+    let ok = unsafe {
+        let ptr = SELF_TEST_USER_VIRT as *mut u64;
+        ptr.write_volatile(0xA11C_0A11_C0DE_5A5A);
+        ptr.read_volatile() == 0xA11C_0A11_C0DE_5A5A
+    };
+
+    // Switch back before touching anything else: kernel code and data
+    // must be exactly as usable as before, since it never actually
+    // moved -- only the private half changed underneath it.
+    unsafe { write_cr3(old_cr3) };
+    log_debug!(
+        "VMM",
+        "AddressSpaceSelfTest",
+        "Restored kernel CR3 {:#x} after running with {:#x} active",
+        old_cr3,
+        aspace.pml4_phys
+    );
+
+    if !ok {
+        log_fail!(
+            "VMM",
+            "AddressSpaceSelfTest",
+            "Private-half mapping did not read back correctly while active"
+        );
+        return;
+    }
+
+    // Dropping tears down the private half -- including the page tables
+    // `map` just allocated and the data frame itself -- without going
+    // anywhere near the shared kernel half.
+    drop(aspace);
+
+    let frames_after = pmm::free_frame_count();
+    if frames_after != frames_before {
+        log_fail!(
+            "VMM",
+            "AddressSpaceSelfTest",
+            "Frames leaked: {} free before, {} after",
+            frames_before,
+            frames_after
+        );
+        return;
+    }
+
+    log_ok!(
+        "VMM",
+        "AddressSpaceSelfTest",
+        "New address space shares the kernel half (verified by walk and by live CR3 switch), private half torn down cleanly ({} frames free)",
+        frames_after
+    );
 }

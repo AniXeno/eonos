@@ -82,7 +82,9 @@ unsafe extern "C" fn _start() -> ! {
     syscall::init();
     syscall::self_test();
 
-    // TODO: per-process address spaces, ELF loader + initramfs
+    vmm::address_space_self_test();
+
+    // TODO: ELF loader + initramfs
 
     log_ok!("Kernel", "Init", "Initialization complete, handing over to the scheduler");
 
