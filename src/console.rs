@@ -322,6 +322,21 @@ impl Console {
                         self.cursor_left(n);
                         self.esc = EscState::Normal;
                     }
+                    'J' => {
+                        // CSI 2 J -- "clear entire screen". Real
+                        // terminals distinguish "clear from cursor",
+                        // "clear to cursor", and "clear all" by the
+                        // parameter; this console only ever needs the
+                        // shell's `clear` command, which always wants
+                        // the whole screen, so every parameter value
+                        // clears everything rather than tracking the
+                        // distinction. Home the cursor too, matching
+                        // what `clear` on a real terminal looks like
+                        // (it's normally paired with CSI H).
+                        self.push_param();
+                        self.clear();
+                        self.esc = EscState::Normal;
+                    }
                     _ => self.esc = EscState::Normal,
                 }
                 return;

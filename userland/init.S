@@ -5,11 +5,8 @@
 # RDI/RSI/RDX/R10, result in RAX):
 #
 #     0  read(fd, buf, len)          -- fd 0 only; one line, canonical
-#                                       mode, echoed by the kernel. The
-#                                       "keyboard" is COM1 for now --
-#                                       there's no PS/2 or USB HID
-#                                       driver yet, so this is what you
-#                                       type into QEMU's serial console.
+#                                       mode, echoed by the kernel, from
+#                                       the PS/2 keyboard and/or COM1.
 #     1  write(fd, buf, len)
 #    24  sched_yield()
 #    39  getpid()
@@ -21,10 +18,10 @@
 #  9002  eonos_read_file(name, name_len, buf, buf_len)
 #                                     -- whole-file read by path.
 #                                       Stopgap for `cat`.
+#  9003  eonos_uptime_ms()           -- milliseconds since boot.
 #
-# Commands: ls, cat <file>, help, exit. Anything else is "unknown
-# command". No pipes, no args beyond a single filename, no scripting --
-# just enough to poke at the initramfs from a prompt.
+# Commands: ls, cat <file>, echo <text>, clear, uptime, pid, help, exit.
+# No pipes, no scripting -- just enough to poke around from a prompt.
 
 .intel_syntax noprefix
 
@@ -34,13 +31,14 @@ line_buf:   .skip 128
 LINE_CAP = 128
 file_buf:   .skip 4096
 FILE_CAP = 4096
+numbuf:     .skip 24                # enough for any 64-bit value in decimal
 
 .section .rodata
 msg_banner:   .ascii "EonOS shell -- type 'help' for commands\n"
 .equ msg_banner_len, . - msg_banner
 prompt:       .ascii "eonsh> "
 .equ prompt_len, . - prompt
-msg_help:     .ascii "commands: ls, cat <file>, help, exit\n"
+msg_help:     .ascii "commands: ls, cat <file>, echo <text>, clear, uptime, pid, help, exit\n"
 .equ msg_help_len, . - msg_help
 msg_unknown:  .ascii "unknown command: "
 .equ msg_unknown_len, . - msg_unknown
@@ -48,11 +46,19 @@ msg_notfound: .ascii "cat: no such file\n"
 .equ msg_notfound_len, . - msg_notfound
 msg_toobig:   .ascii "cat: file too large to display\n"
 .equ msg_toobig_len, . - msg_toobig
+msg_uptime_suffix: .ascii " ms\n"
+.equ msg_uptime_suffix_len, . - msg_uptime_suffix
 newline:      .ascii "\n"
+clear_seq:    .ascii "\x1b[2J\x1b[H"    # CSI 2J (clear) + CSI H (home)
+.equ clear_seq_len, . - clear_seq
 cmd_ls:       .ascii "ls"
 cmd_help:     .ascii "help"
 cmd_exit:     .ascii "exit"
+cmd_clear:    .ascii "clear"
+cmd_uptime:   .ascii "uptime"
+cmd_pid:      .ascii "pid"
 cmd_cat:      .ascii "cat "   # note trailing space: "cat" alone is not this
+cmd_echo:     .ascii "echo "  # same convention; bare "echo" prints nothing
 
 .section .text
 .global _start
@@ -121,17 +127,70 @@ _start:
 
 .Ltry_cat:
     cmp  rcx, 4
-    jle  .Lunknown                      # need at least "cat " + 1 char
+    jle  .Ltry_echo                      # need at least "cat " + 1 char
     lea  rdi, [rip + cmd_cat]
     mov  r8, 4
     call strprefix
     test rax, rax
-    jz   .Lunknown
+    jz   .Ltry_echo
     lea  rsi, [rip + line_buf]
     lea  rsi, [rsi + 4]                 # filename starts after "cat "
     mov  rdx, rcx
     sub  rdx, 4                         # filename length
     call do_cat
+    jmp  .Lloop
+
+.Ltry_echo:
+    cmp  rcx, 5
+    jle  .Ltry_clear                     # need at least "echo " + 1 char
+    lea  rdi, [rip + cmd_echo]
+    mov  r8, 5
+    call strprefix
+    test rax, rax
+    jz   .Ltry_clear
+    lea  rsi, [rip + line_buf]
+    lea  rsi, [rsi + 5]                 # text starts after "echo "
+    mov  rdx, rcx
+    sub  rdx, 5
+    call print
+    lea  rsi, [rip + newline]
+    mov  edx, 1
+    call print
+    jmp  .Lloop
+
+.Ltry_clear:
+    cmp  rcx, 5
+    jne  .Ltry_uptime
+    lea  rdi, [rip + cmd_clear]
+    mov  r8, rcx
+    call streq
+    test rax, rax
+    jz   .Ltry_uptime
+    lea  rsi, [rip + clear_seq]
+    mov  edx, clear_seq_len
+    call print
+    jmp  .Lloop
+
+.Ltry_uptime:
+    cmp  rcx, 6
+    jne  .Ltry_pid
+    lea  rdi, [rip + cmd_uptime]
+    mov  r8, rcx
+    call streq
+    test rax, rax
+    jz   .Ltry_pid
+    call do_uptime
+    jmp  .Lloop
+
+.Ltry_pid:
+    cmp  rcx, 3
+    jne  .Lunknown
+    lea  rdi, [rip + cmd_pid]
+    mov  r8, rcx
+    call streq
+    test rax, rax
+    jz   .Lunknown
+    call do_pid
     jmp  .Lloop
 
 .Lunknown:
@@ -208,6 +267,63 @@ do_cat:
 3:  pop  r13
     pop  r12
     pop  rbx
+    ret
+
+# ---------------------------------------------------------------------
+# do_uptime: print milliseconds since boot.
+# ---------------------------------------------------------------------
+do_uptime:
+    push rbx
+    mov  eax, 9003                      # eonos_uptime_ms
+    syscall
+    mov  rbx, rax
+    call print_u64_decimal
+    lea  rsi, [rip + msg_uptime_suffix]
+    mov  edx, msg_uptime_suffix_len
+    call print
+    pop  rbx
+    ret
+
+# ---------------------------------------------------------------------
+# do_pid: print this process's pid.
+# ---------------------------------------------------------------------
+do_pid:
+    push rbx
+    mov  eax, 39                        # getpid
+    syscall
+    mov  rbx, rax
+    call print_u64_decimal
+    lea  rsi, [rip + newline]
+    mov  edx, 1
+    call print
+    pop  rbx
+    ret
+
+# ---------------------------------------------------------------------
+# print_u64_decimal: print rbx as unsigned decimal, no newline. Builds
+# digits least-significant-first into numbuf from the end, then prints
+# the used portion in one write -- simplest way to get the digits out
+# in the right order without a second reversal pass over the buffer.
+# Clobbers rax, rcx, rdx, rsi, rdi, r8, r9.
+# ---------------------------------------------------------------------
+print_u64_decimal:
+    lea  r8, [rip + numbuf]
+    add  r8, 24                         # r9 will fill backward from here
+    mov  r9, r8
+    mov  rax, rbx
+    mov  rcx, 10
+.Ldigit_loop:
+    xor  rdx, rdx
+    div  rcx                            # rax /= 10, rdx = rax % 10
+    add  dl, '0'
+    dec  r9
+    mov  [r9], dl
+    test rax, rax
+    jnz  .Ldigit_loop
+    mov  rsi, r9
+    mov  rdx, r8
+    sub  rdx, r9                        # length = end - start
+    call print
     ret
 
 # ---------------------------------------------------------------------

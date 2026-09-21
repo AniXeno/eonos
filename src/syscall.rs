@@ -223,6 +223,11 @@ pub const SYS_EXIT: u64 = 60;
 // `ls`/`cat` and are expected to go away once EonOS has real fds.
 pub const SYS_LIST_FILES: u64 = 9001;
 pub const SYS_READ_FILE: u64 = 9002;
+/// Milliseconds since boot, per `pit::uptime_ms()`. Backs the shell's
+/// `uptime` command; Linux has no equivalent single-call primitive
+/// (it's normally read out of /proc), so this gets an EonOS-specific
+/// number like the two above rather than trying to match a real one.
+pub const SYS_UPTIME_MS: u64 = 9003;
 
 const EBADF: i64 = 9;
 const EFAULT: i64 = 14;
@@ -620,6 +625,7 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
         SYS_WRITE => frame.rax = sys_write(frame.rdi, frame.rsi, frame.rdx),
         SYS_LIST_FILES => frame.rax = sys_list_files(frame.rdi, frame.rsi),
         SYS_READ_FILE => frame.rax = sys_read_file(frame.rdi, frame.rsi, frame.rdx, frame.r10),
+        SYS_UPTIME_MS => frame.rax = pit::uptime_ms(),
         SYS_SCHED_YIELD => {
             scheduler::yield_now();
             frame.rax = 0;
