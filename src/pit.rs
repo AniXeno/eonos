@@ -86,9 +86,19 @@ pub fn uptime_ms() -> u64 {
     ticks() * 1000 / hz
 }
 
-/// Wait (via `hlt`, so the CPU is actually idle) for a handful of ticks
-/// to arrive and confirm they did. Call this only after
-/// `idt::enable_interrupts()` has run.
+/// Wait for a handful of ticks to arrive and confirm they did. Call this
+/// only after `idt::enable_interrupts()` has run.
+///
+/// Spins on `pause`, not `hlt`: `hlt` only returns because *some*
+/// interrupt arrived, which is exactly the assumption this test exists
+/// to check -- on real hardware where firmware never programmed the
+/// legacy 8259 (increasingly common on UEFI-only machines, which
+/// expect an IOAPIC-aware OS instead), IRQ0 can simply never arrive,
+/// and `hlt` would then block forever with nothing left to wake it,
+/// turning a should-fail self-test into a silent hang. The timeout is
+/// instead measured with `rdtsc`, which free-runs regardless of
+/// interrupt delivery, so "no ticks showed up" is reliably detected
+/// and reported rather than hanging boot.
 pub fn self_test() {
     let hz = frequency_hz();
     if hz == 0 {
@@ -100,16 +110,27 @@ pub fn self_test() {
     let target_ticks = (hz / 20).max(1); // ~50ms worth of ticks
     let deadline = start + target_ticks;
 
-    let mut spins = 0u64;
+    let tsc_start = rdtsc();
+    // No calibrated TSC frequency exists yet this early in boot, so
+    // this timeout is deliberately generous rather than precise: 2^33
+    // cycles is on the order of several seconds even on a very slow
+    // CPU (at 1 GHz; real CPUs are far faster), comfortably longer than
+    // 50ms of real ticks could ever take to arrive if IRQ0 works at
+    // all, while still bounded so a genuinely dead PIC reports failure
+    // in a few seconds instead of hanging boot indefinitely.
+    let tsc_timeout = 1u64 << 33;
+
     while ticks() < deadline {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
-        spins += 1;
-        if spins > 50_000_000 {
+        unsafe { core::arch::asm!("pause", options(nomem, nostack)) };
+        if rdtsc().wrapping_sub(tsc_start) > tsc_timeout {
             log_fail!(
                 "PIT",
                 "SelfTest",
-                "No timer interrupts after {} hlt cycles -- IRQ0 is not reaching the handler",
-                spins
+                "No timer interrupts after ~{} TSC cycles -- IRQ0 is not reaching the handler \
+                 (common on UEFI-only hardware that never programmed the legacy PIC; this kernel \
+                 has no IOAPIC support yet, so the timer and any other legacy-IRQ device will be \
+                 unusable on this machine)",
+                tsc_timeout
             );
             return;
         }
@@ -123,4 +144,13 @@ pub fn self_test() {
         (ticks() - start) * 1000 / hz,
         uptime_ms()
     );
+}
+
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | lo as u64
 }

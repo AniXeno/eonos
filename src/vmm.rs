@@ -14,6 +14,7 @@ const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const PWT: u64 = 1 << 3;
+const PCD: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
 
@@ -38,6 +39,15 @@ pub const USER_RW: u64 = PRESENT | WRITABLE | USER | NO_EXECUTE;
 /// being written (WC writes can sit in a fill buffer for a while) or for
 /// device registers with side effects on individual writes.
 pub const KERNEL_WC: u64 = PRESENT | WRITABLE | NO_EXECUTE | PWT;
+/// Fully uncacheable: every load/store goes straight to the device,
+/// nothing buffered or reordered by the cache. Required for real
+/// device registers with side effects on read/write -- xHCI's
+/// capability/operational/runtime/doorbell registers, for instance --
+/// where `KERNEL_WC`'s write-buffering or an ordinary cacheable mapping
+/// would both be actively wrong (a doorbell write sitting in a fill
+/// buffer instead of reaching the controller, or a stale cached read of
+/// a status register that the controller has since changed).
+pub const KERNEL_UC: u64 = PRESENT | WRITABLE | NO_EXECUTE | PCD;
 
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const ENTRIES: usize = 512;
@@ -209,6 +219,45 @@ pub fn map_page(virt: u64, phys: u64, flags: u64) {
         map4k(table_ptr(vmm.pml4_phys), virt, phys, flags);
         invlpg(virt);
     }
+}
+
+/// Map a device's physical MMIO range so it's actually safe to read
+/// through `pmm::phys_to_virt` -- which just does `hhdm_offset() +
+/// phys` and assumes the page is already mapped, true for RAM (which
+/// `map_hhdm_range` covers at boot) but not for PCI BAR space, which
+/// sits outside the bootloader's memory map entirely and is therefore
+/// unmapped until something maps it. Reuses the HHDM's own virtual
+/// address convention (`hhdm_offset() + phys`) rather than inventing a
+/// separate MMIO virtual range, so `phys_to_virt` keeps working
+/// unchanged for both RAM and, once mapped here, device registers.
+///
+/// Always maps `KERNEL_UC`: every current caller (xHCI's capability/
+/// operational/runtime/doorbell registers) is registers with side
+/// effects, where a cacheable or write-combined mapping would be
+/// actively wrong (see `KERNEL_UC`'s own doc comment). A future caller
+/// wanting a linear framebuffer-like BAR would need its own entry
+/// point using `KERNEL_WC` instead -- deliberately not this one, so
+/// picking the wrong attribute for register access isn't the easy
+/// default.
+///
+/// `phys` and `len` need not be page-aligned; every page the range
+/// touches is mapped. Safe to call more than once on overlapping
+/// ranges as long as pages already mapped by an earlier call aren't
+/// mapped again with different flags -- `map4k` asserts on that rather
+/// than silently changing an existing mapping's attributes.
+pub fn map_mmio(phys: u64, len: u64) -> *mut u8 {
+    let hhdm = pmm::hhdm_offset();
+    let start = phys & !(PAGE_SIZE - 1);
+    let end = (phys + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let mut p = start;
+    while p < end {
+        let virt = hhdm + p;
+        if translate(virt).is_none() {
+            map_page(virt, p, KERNEL_UC);
+        }
+        p += PAGE_SIZE;
+    }
+    (hhdm + phys) as *mut u8
 }
 
 pub fn unmap_page(virt: u64) {

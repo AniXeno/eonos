@@ -274,7 +274,11 @@ static HISTORY: sync::IrqMutex<alloc::collections::VecDeque<alloc::vec::Vec<u8>>
 /// the other beyond "whichever has something waiting first".
 fn next_byte() -> u8 {
     loop {
+        crate::drivers::usb::xhci::poll();
         if let Some(b) = crate::drivers::ps2::try_read_byte() {
+            return b;
+        }
+        if let Some(b) = crate::drivers::usb::xhci::try_read_byte() {
             return b;
         }
         if let Some(b) = crate::serial::SERIAL1.lock().try_read_byte() {
@@ -387,7 +391,8 @@ fn redraw_tail(line: &[u8], from: usize, cursor: usize) {
 
 /// Read one line of input for `sys_read(0, ...)`.
 ///
-/// Input comes from either the PS/2 keyboard (`drivers::ps2`) or the
+/// Input comes from the PS/2 keyboard (`drivers::ps2`), a USB HID boot
+/// keyboard (`drivers::usb::xhci`), or the
 /// serial port (COM1 -- in QEMU, typically `-serial stdio`, i.e. the
 /// host terminal); both are polled so either can drive the shell.
 /// This does canonical-mode editing in the kernel -- echoing bytes
