@@ -325,18 +325,48 @@ fn decode_escape() -> EditAction {
 /// Used for history recall, where the whole line changes at once
 /// rather than one character at a time.
 fn replace_line(line: &mut alloc::vec::Vec<u8>, cursor: &mut usize, new_line: alloc::vec::Vec<u8>) {
-    for _ in 0..*cursor {
-        console_write(b"\x08");
-    }
+    cursor_left(*cursor);
     for _ in 0..line.len() {
         console_write(b" ");
     }
-    for _ in 0..line.len() {
-        console_write(b"\x08");
-    }
+    cursor_left(line.len());
     console_write(&new_line);
     *line = new_line;
     *cursor = line.len();
+}
+
+/// Move the terminal cursor left `n` cells without touching what's
+/// drawn there, via the standard `CSI n D` sequence (`console.rs`
+/// handles it; a real serial terminal understands it natively too).
+/// Distinct from sending literal `0x08` bytes, which both this
+/// console and real terminals treat as destructive backspace -- correct
+/// for deleting a character, wrong for merely repositioning over
+/// content that must stay on screen (redraws, arrow-key movement).
+fn cursor_left(n: usize) {
+    if n == 0 {
+        return;
+    }
+    let mut seq = alloc::vec::Vec::new();
+    seq.extend_from_slice(b"\x1b[");
+    seq.extend_from_slice(itoa(n).as_bytes());
+    seq.push(b'D');
+    console_write(&seq);
+}
+
+/// Minimal integer-to-decimal-ASCII, since `core::fmt` formatting isn't
+/// worth pulling into this hot little path. `n` is always small here
+/// (line lengths), so no need for anything fancier.
+fn itoa(mut n: usize) -> alloc::string::String {
+    if n == 0 {
+        return alloc::string::String::from("0");
+    }
+    let mut digits = alloc::vec::Vec::new();
+    while n > 0 {
+        digits.push(b'0' + (n % 10) as u8);
+        n /= 10;
+    }
+    digits.reverse();
+    alloc::string::String::from_utf8(digits).unwrap()
 }
 
 /// Redraw the visible line from `from` (a byte index into `line`) to
@@ -347,10 +377,7 @@ fn replace_line(line: &mut alloc::vec::Vec<u8>, cursor: &mut usize, new_line: al
 fn redraw_tail(line: &[u8], from: usize, cursor: usize) {
     console_write(&line[from..]);
     console_write(b" "); // erase whatever character used to trail here
-    let to_move_back = line.len() - cursor + 1;
-    for _ in 0..to_move_back {
-        console_write(b"\x08");
-    }
+    cursor_left(line.len() - cursor + 1);
 }
 
 /// Read one line of input for `sys_read(0, ...)`.
@@ -392,7 +419,7 @@ fn read_line(max: usize) -> alloc::vec::Vec<u8> {
                     EditAction::Left => {
                         if cursor > 0 {
                             cursor -= 1;
-                            console_write(b"\x08");
+                            cursor_left(1);
                         }
                     }
                     EditAction::Right => {
@@ -402,9 +429,7 @@ fn read_line(max: usize) -> alloc::vec::Vec<u8> {
                         }
                     }
                     EditAction::Home => {
-                        for _ in 0..cursor {
-                            console_write(b"\x08");
-                        }
+                        cursor_left(cursor);
                         cursor = 0;
                     }
                     EditAction::End => {

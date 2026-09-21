@@ -310,6 +310,18 @@ impl Console {
                         self.apply_sgr();
                         self.esc = EscState::Normal;
                     }
+                    'D' => {
+                        // CSI n D -- "cursor back n": standard ANSI,
+                        // and the escape `syscall::redraw_tail` uses to
+                        // reposition after a redraw without disturbing
+                        // the just-drawn cells it passes over (unlike
+                        // `\x08`, which intentionally blanks). Default
+                        // to 1 with no parameter, same as real terminals.
+                        self.push_param();
+                        let n = if self.nparams > 0 { self.params[0] as usize } else { 1 };
+                        self.cursor_left(n);
+                        self.esc = EscState::Normal;
+                    }
                     _ => self.esc = EscState::Normal,
                 }
                 return;
@@ -320,6 +332,7 @@ impl Console {
         match c {
             '\n' => self.newline(),
             '\r' => self.cursor_col = 0,
+            '\x08' => self.backspace(),
             '\t' => {
                 let next = (self.cursor_col + 4) & !3;
                 while self.cursor_col < next {
@@ -328,6 +341,32 @@ impl Console {
             }
             c => self.put_printable(c),
         }
+    }
+
+    /// Move the cursor one cell left and blank whatever glyph is there,
+    /// matching what a real terminal does for `0x08` -- unlike '\n'/'\r'
+    /// this can't be a bare cursor-position update, because leaving the
+    /// old glyph on screen is exactly the bug this exists to fix (a
+    /// deleted character staying visible after the line shrinks). Does
+    /// nothing at column 0: this console has no concept of un-wrapping
+    /// onto the previous row, so a caller backspacing across a line
+    /// boundary would need to track that itself.
+    fn backspace(&mut self) {
+        if self.cursor_col == 0 {
+            return;
+        }
+        self.cursor_col -= 1;
+        self.draw_glyph(' ', self.cursor_col, self.cursor_row);
+    }
+
+    /// Move the cursor left `n` cells without touching what's drawn
+    /// there -- for repositioning after a redraw, where the cells being
+    /// passed over already hold the correct final content and must not
+    /// be blanked (unlike `backspace`, which exists precisely to blank
+    /// the cell it moves over). Exposed to callers via the `\x1b[<n>D`
+    /// CSI sequence (see `EscState::Csi` handling above).
+    pub fn cursor_left(&mut self, n: usize) {
+        self.cursor_col = self.cursor_col.saturating_sub(n);
     }
 }
 
