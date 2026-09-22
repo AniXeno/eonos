@@ -392,7 +392,9 @@ fn kill_user_process(frame: &InterruptFrame) -> ! {
         );
     }
 
-    crate::process::exit_current(128 + frame.vector as i64)
+    // x86 page fault (#PF) is the user-visible SIGSEGV equivalent.
+    // Keep the conventional shell status 128 + SIGSEGV (11).
+    crate::process::exit_current(if frame.vector == 14 { 139 } else { 128 + frame.vector as i64 })
 }
 
 fn irq_dispatch(frame: &InterruptFrame) {

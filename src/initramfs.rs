@@ -179,6 +179,23 @@ pub fn find(path: &str) -> Option<&'static [u8]> {
     entries().find(|e| e.name == want).map(|e| e.data)
 }
 
+/// Return bytes for a boot module whose configured path ends in
+/// `suffix`, such as `initramfs.tar` or `fat32.img`.
+pub fn module_bytes(suffix: &str) -> Option<&'static [u8]> {
+    let response = MODULE_REQUEST.get_response()?;
+    let file = response.modules().iter().find(|f| {
+        let path = core::str::from_utf8(f.path().to_bytes()).unwrap_or("");
+        path.ends_with(suffix)
+    })?;
+    let base = file.addr() as *const u8;
+    let size = usize::try_from(file.size()).ok()?;
+    if size == 0 { return None; }
+    let first = base as u64;
+    let last = first.checked_add(size as u64 - 1)?;
+    if crate::vmm::translate(first).is_none() || crate::vmm::translate(last).is_none() { return None; }
+    Some(unsafe { core::slice::from_raw_parts(base, size) })
+}
+
 /// Locate the initramfs module Limine loaded. Call after `vmm::init`
 /// (the module is reached through the direct map).
 pub fn init() {
@@ -190,11 +207,13 @@ pub fn init() {
         );
         return;
     };
-    let Some(file) = response.modules().first() else {
+    let Some(file) = response.modules().iter().find(|f| {
+        core::str::from_utf8(f.path().to_bytes()).unwrap_or("").ends_with("initramfs.tar")
+    }) else {
         log_fail!(
             "Initramfs",
             "Init",
-            "Limine loaded no modules (is `module_path` set in limine.conf?)"
+            "Limine did not load initramfs.tar (check module_path in limine.conf)"
         );
         return;
     };

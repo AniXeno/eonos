@@ -214,6 +214,9 @@ pub const SYS_WRITE: u64 = 1;
 pub const SYS_SCHED_YIELD: u64 = 24;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_EXIT: u64 = 60;
+pub const SYS_WAIT4: u64 = 61;
+pub const SYS_OPEN: u64 = 2;
+pub const SYS_CLOSE: u64 = 3;
 
 // EonOS-specific calls, well clear of Linux's own numbers, standing in
 // for a real filesystem (open/read/close on the initramfs) until one
@@ -228,6 +231,11 @@ pub const SYS_READ_FILE: u64 = 9002;
 /// (it's normally read out of /proc), so this gets an EonOS-specific
 /// number like the two above rather than trying to match a real one.
 pub const SYS_UPTIME_MS: u64 = 9003;
+pub const SYS_SLEEP_MS: u64 = 9004;
+pub const SYS_EXEC: u64 = 9005;
+
+struct OpenFile { pid: u64, fd: u64, path: alloc::string::String, offset: usize }
+static OPEN_FILES: sync::IrqMutex<alloc::vec::Vec<OpenFile>> = sync::IrqMutex::new(alloc::vec::Vec::new());
 
 const EBADF: i64 = 9;
 const EFAULT: i64 = 14;
@@ -235,6 +243,7 @@ const ENOENT: i64 = 2;
 const ENOSYS: i64 = 38;
 const ENAMETOOLONG: i64 = 36;
 const ERANGE: i64 = 34;
+const ESRCH: i64 = 3;
 
 /// Encode a positive errno as the negative value a syscall returns.
 const fn errno(e: i64) -> u64 {
@@ -542,7 +551,18 @@ fn read_line(max: usize) -> alloc::vec::Vec<u8> {
 
 fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if fd != 0 {
-        return errno(EBADF);
+        let pid = scheduler::current_id();
+        let mut files = OPEN_FILES.lock();
+        let Some(file) = files.iter_mut().find(|f| f.pid == pid && f.fd == fd) else { return errno(EBADF) };
+        let n = (len as usize).min(MAX_WRITE);
+        let mut data = alloc::vec![0; n];
+        let read = match crate::vfs::read_at(&file.path, file.offset, &mut data) {
+            Ok(n) => n,
+            Err(_) => return errno(ENOENT),
+        };
+        if !vmm::copy_to_user(buf, &data[..read]) { return errno(EFAULT); }
+        file.offset += read;
+        return read as u64;
     }
     let n = (len as usize).min(MAX_WRITE);
     if n == 0 {
@@ -555,17 +575,70 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     line.len() as u64
 }
 
+fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
+    let n = path_len as usize;
+    if n > MAX_NAME { return errno(ENAMETOOLONG); }
+    let mut path = alloc::vec![0; n];
+    if !vmm::copy_from_user(&mut path, path_ptr) { return errno(EFAULT); }
+    let Ok(path) = core::str::from_utf8(&path) else { return errno(ENOENT) };
+    if crate::vfs::file_size(path).is_err() { return errno(ENOENT); }
+    let pid = scheduler::current_id();
+    let mut files = OPEN_FILES.lock();
+    let fd = (3..).find(|fd| !files.iter().any(|f| f.pid == pid && f.fd == *fd)).unwrap_or(3);
+    files.push(OpenFile { pid, fd, path: alloc::string::String::from(path), offset: 0 });
+    fd
+}
+
+fn sys_close(fd: u64) -> u64 {
+    let pid = scheduler::current_id();
+    let mut files = OPEN_FILES.lock();
+    if let Some(i) = files.iter().position(|f| f.pid == pid && f.fd == fd) { files.swap_remove(i); 0 } else { errno(EBADF) }
+}
+
+/// Drop a process's file descriptors as part of process teardown.
+pub fn close_process_files(pid: u64) {
+    OPEN_FILES.lock().retain(|f| f.pid != pid);
+}
+
+fn sys_kill(pid: u64, signal: u64) -> u64 {
+    if pid != scheduler::current_id() { return errno(ESRCH); }
+    match signal {
+        0 => 0,
+        9 | 15 => process::exit_current(128 + signal as i64),
+        _ => errno(ENOSYS),
+    }
+}
+
+fn sys_exec(path_ptr: u64, path_len: u64) -> u64 {
+    let n = path_len as usize;
+    if n > MAX_NAME { return errno(ENAMETOOLONG); }
+    let mut path = alloc::vec![0; n];
+    if !vmm::copy_from_user(&mut path, path_ptr) { return errno(EFAULT); }
+    let Ok(path) = core::str::from_utf8(&path) else { return errno(ENOENT) };
+    match process::spawn(path) { Ok(pid) => pid, Err(_) => errno(ENOENT) }
+}
+
+fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
+    loop {
+        if let Some(status) = process::take_exit_status(pid) {
+            if status_ptr != 0 && !vmm::copy_to_user(status_ptr, &(status as i32).to_ne_bytes()) { return errno(EFAULT); }
+            return pid;
+        }
+        scheduler::yield_now();
+    }
+}
+
 /// Longest path/file name the file stopgap syscalls accept.
 const MAX_NAME: usize = 255;
 
 fn sys_list_files(buf: u64, len: u64) -> u64 {
     let cap = (len as usize).min(MAX_WRITE);
     let mut out = alloc::vec::Vec::new();
-    for e in crate::initramfs::entries() {
+    for e in crate::vfs::list_files() {
         if !out.is_empty() {
             out.push(b'\n');
         }
-        out.extend_from_slice(e.name.as_bytes());
+        out.extend_from_slice(e.as_bytes());
     }
     if out.len() > cap {
         return errno(ERANGE);
@@ -588,14 +661,14 @@ fn sys_read_file(name_ptr: u64, name_len: u64, buf: u64, buf_len: u64) -> u64 {
     let Ok(name) = core::str::from_utf8(&name) else {
         return errno(ENOENT);
     };
-    let Some(data) = crate::initramfs::find(name) else {
-        return errno(ENOENT);
-    };
     let cap = (buf_len as usize).min(MAX_WRITE);
+    let Ok(file_size) = crate::vfs::file_size(name) else { return errno(ENOENT) };
+    if file_size > cap { return errno(ERANGE); }
+    let Ok(data) = crate::vfs::read_all(name) else { return errno(ENOENT) };
     if data.len() > cap {
         return errno(ERANGE);
     }
-    if !vmm::copy_to_user(buf, data) {
+    if !vmm::copy_to_user(buf, &data) {
         return errno(EFAULT);
     }
     data.len() as u64
@@ -626,11 +699,17 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
     crate::idt::enable_interrupts();
 
     match frame.rax {
+        SYS_OPEN => frame.rax = sys_open(frame.rdi, frame.rsi),
+        SYS_CLOSE => frame.rax = sys_close(frame.rdi),
         SYS_READ => frame.rax = sys_read(frame.rdi, frame.rsi, frame.rdx),
         SYS_WRITE => frame.rax = sys_write(frame.rdi, frame.rsi, frame.rdx),
         SYS_LIST_FILES => frame.rax = sys_list_files(frame.rdi, frame.rsi),
         SYS_READ_FILE => frame.rax = sys_read_file(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         SYS_UPTIME_MS => frame.rax = pit::uptime_ms(),
+        SYS_SLEEP_MS => { scheduler::sleep_ms(frame.rdi); frame.rax = 0; }
+        SYS_EXEC => frame.rax = sys_exec(frame.rdi, frame.rsi),
+        SYS_WAIT4 => frame.rax = sys_waitpid(frame.rdi, frame.rdx),
+        62 => frame.rax = sys_kill(frame.rdi, frame.rsi),
         SYS_SCHED_YIELD => {
             scheduler::yield_now();
             frame.rax = 0;

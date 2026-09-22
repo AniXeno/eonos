@@ -22,7 +22,7 @@ use core::fmt;
 use crate::elf::{self, ElfError};
 use crate::pmm::{self, PAGE_SIZE};
 use crate::sync::IrqMutex;
-use crate::{heap, initramfs, pit, scheduler, vmm};
+use crate::{heap, pit, scheduler, vfs, vmm};
 use crate::{log_debug, log_fail, log_ok};
 
 /// One past the highest byte of the user stack. The stack grows down
@@ -95,6 +95,7 @@ fn register(pid: u64, name: &str) {
 /// the scheduler once this thread is off the CPU for good.
 pub fn exit_current(code: i64) -> ! {
     let pid = scheduler::current_id();
+    crate::syscall::close_process_files(pid);
     let name = {
         let mut procs = PROCS.lock();
         match procs.iter().position(|r| r.pid == pid) {
@@ -177,10 +178,10 @@ fn build_stack(aspace: &vmm::AddressSpace, arg0: &str) -> Option<u64> {
 /// Start the executable at `path` in the initramfs as a new process and
 /// return its pid.
 pub fn spawn(path: &str) -> Result<u64, SpawnError> {
-    let image = initramfs::find(path).ok_or(SpawnError::NotFound)?;
+    let image = vfs::read_all(path).map_err(|_| SpawnError::NotFound)?;
 
     let aspace = vmm::create_address_space().ok_or(SpawnError::NoMemory)?;
-    let entry = elf::load(image, &aspace).map_err(SpawnError::Elf)?;
+    let entry = elf::load(&image, &aspace).map_err(SpawnError::Elf)?;
     let rsp = build_stack(&aspace, path).ok_or(SpawnError::NoMemory)?;
 
     // From here on the thread owns the address space (and if creating

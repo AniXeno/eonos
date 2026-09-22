@@ -6,13 +6,29 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 BUILD_DIR="$ROOT/build"
-ISO_PATH="$BUILD_DIR/iso_output/eonos.iso"
+DEBUG_BUILD=0
+if [ "${1:-}" = "--debug" ]; then
+    DEBUG_BUILD=1
+elif [ "$#" -ne 0 ]; then
+    echo "Usage: $0 [--debug]" >&2
+    exit 2
+fi
+
+if [ "$DEBUG_BUILD" = "1" ]; then
+    ISO_PATH="$BUILD_DIR/iso_output/eonos_debugbuild.iso"
+else
+    ISO_PATH="$BUILD_DIR/iso_output/eonos.iso"
+fi
 
 UEFI="${UEFI:-1}"
 
 if [ ! -f "$ISO_PATH" ]; then
     echo "No built ISO found, building it first..."
-    ./build.sh
+    if [ "$DEBUG_BUILD" = "1" ]; then
+        ./build.sh --debug
+    else
+        ./build.sh
+    fi
 fi
 
 ARGS=(

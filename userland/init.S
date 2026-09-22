@@ -32,18 +32,21 @@ LINE_CAP = 128
 file_buf:   .skip 4096
 FILE_CAP = 4096
 numbuf:     .skip 24                # enough for any 64-bit value in decimal
+wait_status: .skip 4
 
 .section .rodata
 msg_banner:   .ascii "EonOS shell -- type 'help' for commands\n"
 .equ msg_banner_len, . - msg_banner
 prompt:       .ascii "eonsh> "
 .equ prompt_len, . - prompt
-msg_help:     .ascii "commands: ls, cat <file>, echo <text>, clear, uptime, pid, help, exit\n"
+msg_help:     .ascii "commands: ls, cat <file>, exec <file>, echo <text>, clear, uptime, pid, help, exit\n"
 .equ msg_help_len, . - msg_help
 msg_unknown:  .ascii "unknown command: "
 .equ msg_unknown_len, . - msg_unknown
 msg_notfound: .ascii "cat: no such file\n"
 .equ msg_notfound_len, . - msg_notfound
+msg_exec_error: .ascii "exec: unable to launch file\n"
+.equ msg_exec_error_len, . - msg_exec_error
 msg_toobig:   .ascii "cat: file too large to display\n"
 .equ msg_toobig_len, . - msg_toobig
 msg_uptime_suffix: .ascii " ms\n"
@@ -58,6 +61,7 @@ cmd_clear:    .ascii "clear"
 cmd_uptime:   .ascii "uptime"
 cmd_pid:      .ascii "pid"
 cmd_cat:      .ascii "cat "   # note trailing space: "cat" alone is not this
+cmd_exec:     .ascii "exec "
 cmd_echo:     .ascii "echo "  # same convention; bare "echo" prints nothing
 
 .section .text
@@ -127,17 +131,43 @@ _start:
 
 .Ltry_cat:
     cmp  rcx, 4
-    jle  .Ltry_echo                      # need at least "cat " + 1 char
+    jle  .Ltry_exec                      # need at least "cat " + 1 char
     lea  rdi, [rip + cmd_cat]
     mov  r8, 4
     call strprefix
     test rax, rax
-    jz   .Ltry_echo
+    jz   .Ltry_exec
     lea  rsi, [rip + line_buf]
     lea  rsi, [rsi + 4]                 # filename starts after "cat "
     mov  rdx, rcx
     sub  rdx, 4                         # filename length
     call do_cat
+    jmp  .Lloop
+
+.Ltry_exec:
+    cmp  rcx, 6
+    jle  .Ltry_echo
+    lea  rdi, [rip + cmd_exec]
+    mov  r8, 5
+    call strprefix
+    test rax, rax
+    jz   .Ltry_echo
+    lea  rdi, [rip + line_buf + 5]      # path pointer (arg 1)
+    mov  rsi, rcx                       # path length (arg 2)
+    sub  rsi, 5
+    mov  eax, 9005
+    syscall
+    test rax, rax
+    js   .Lexec_error
+    mov  rdi, rax
+    lea  rdx, [rip + wait_status]
+    mov  eax, 61
+    syscall
+    jmp  .Lloop
+.Lexec_error:
+    lea  rsi, [rip + msg_exec_error]
+    mov  edx, msg_exec_error_len
+    call print
     jmp  .Lloop
 
 .Ltry_echo:

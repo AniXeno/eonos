@@ -5,7 +5,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-PROFILE="${1:-dev}"
+PROFILE="dev"
+DEBUG_BUILD=0
+for arg in "$@"; do
+    case "$arg" in
+        --debug) DEBUG_BUILD=1 ;;
+        dev|release) PROFILE="$arg" ;;
+        *) echo "Unknown build option: $arg" >&2; exit 2 ;;
+    esac
+done
 
 BUILD_DIR="$ROOT/build"
 ISO_ROOT="$BUILD_DIR/iso_root"
@@ -17,7 +25,11 @@ INITRAMFS_SRC="$ROOT/initramfs"
 
 INITRAMFS_ROOT="$BUILD_DIR/initramfs_root"
 INITRAMFS_NAME="initramfs.tar"
-ISO_NAME="eonos.iso"
+if [ "$DEBUG_BUILD" = "1" ]; then
+    ISO_NAME="eonos_debugbuild.iso"
+else
+    ISO_NAME="eonos.iso"
+fi
 ISO_PATH="$ISO_OUTPUT/$ISO_NAME"
 
 TARGET_DIR="$ROOT/target/x86_64-eonos"
@@ -35,10 +47,18 @@ BUILD_STD_FLAGS=(
 )
 
 if [ "$PROFILE" = "release" ]; then
-    cargo build --release "${BUILD_STD_FLAGS[@]}" --target x86_64-eonos.json
+    if [ "$DEBUG_BUILD" = "1" ]; then
+        cargo build --release --features debug-logs "${BUILD_STD_FLAGS[@]}" --target x86_64-eonos.json
+    else
+        cargo build --release "${BUILD_STD_FLAGS[@]}" --target x86_64-eonos.json
+    fi
     KERNEL_BIN="$TARGET_DIR/release/eonos"
 else
-    cargo build "${BUILD_STD_FLAGS[@]}" --target x86_64-eonos.json
+    if [ "$DEBUG_BUILD" = "1" ]; then
+        cargo build --features debug-logs "${BUILD_STD_FLAGS[@]}" --target x86_64-eonos.json
+    else
+        cargo build "${BUILD_STD_FLAGS[@]}" --target x86_64-eonos.json
+    fi
     KERNEL_BIN="$TARGET_DIR/debug/eonos"
 fi
 
@@ -53,12 +73,35 @@ ld -static -nostdlib \
     -o "$BUILD_DIR/init.elf" \
     "$BUILD_DIR/init.o"
 
+as --64 "$USERLAND_DIR/hello.S" -o "$BUILD_DIR/hello.o"
+
+ld -static -nostdlib \
+    -z max-page-size=4096 \
+    -z noexecstack \
+    -T "$USERLAND_DIR/linker.ld" \
+    -o "$BUILD_DIR/hello.elf" \
+    "$BUILD_DIR/hello.o"
+
+echo "==> Creating FAT32 data volume"
+for tool in mkfs.fat mcopy; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "Required tool '$tool' is missing (install dosfstools and mtools)" >&2
+        exit 1
+    fi
+done
+FAT32_IMAGE="$BUILD_DIR/fat32.img"
+truncate -s 64M "$FAT32_IMAGE"
+mkfs.fat -F 32 -n EONOS "$FAT32_IMAGE" >/dev/null
+mcopy -i "$FAT32_IMAGE" "$BUILD_DIR/hello.elf" ::/HELLO.ELF
+mcopy -i "$FAT32_IMAGE" "$ROOT/README.md" ::/README.TXT
+
 echo "==> Packing initramfs"
 
 mkdir -p "$INITRAMFS_ROOT"
 
 cp -r "$INITRAMFS_SRC"/. "$INITRAMFS_ROOT"/
 cp "$BUILD_DIR/init.elf" "$INITRAMFS_ROOT/init"
+cp "$BUILD_DIR/hello.elf" "$INITRAMFS_ROOT/hello"
 
 tar --format=ustar \
     -cf "$BUILD_DIR/$INITRAMFS_NAME" \
@@ -93,6 +136,8 @@ cp "$ROOT/limine.conf" \
 
 cp "$BUILD_DIR/$INITRAMFS_NAME" \
     "$ISO_ROOT/boot/$INITRAMFS_NAME"
+
+cp "$FAT32_IMAGE" "$ISO_ROOT/boot/fat32.img"
 
 cp \
     "$LIMINE_DIR/limine-bios.sys" \

@@ -57,16 +57,39 @@ pub fn self_test() {
         return;
     };
 
+    if fb.width < 8 || fb.height < 8 || (fb.bpp != 24 && fb.bpp != 32) {
+        log_fail!("Framebuffer", "SelfTest", "Framebuffer is too small or has unsupported pixel format");
+        return;
+    }
+
     let bytes_per_pixel = (fb.bpp as usize) / 8;
-    
+    let mut original = [0u32; 64];
+
     unsafe {
         for y in 0..8 {
             for x in 0..8 {
                 let offset = y * (fb.pitch as usize) + x * bytes_per_pixel;
                 let ptr = fb.addr.add(offset);
+                let i = y * 8 + x;
+                original[i] = ptr.read_volatile() as u32
+                    | ((ptr.add(1).read_volatile() as u32) << 8)
+                    | ((ptr.add(2).read_volatile() as u32) << 16);
                 ptr.write_volatile(0xFF);
                 ptr.add(1).write_volatile(0xFF);
                 ptr.add(2).write_volatile(0xFF);
+            }
+        }
+
+        // A diagnostic must not leave its test pattern on the user's
+        // framebuffer. Restore the original RGB bytes immediately.
+        for y in 0..8 {
+            for x in 0..8 {
+                let offset = y * (fb.pitch as usize) + x * bytes_per_pixel;
+                let ptr = fb.addr.add(offset);
+                let rgb = original[y * 8 + x];
+                ptr.write_volatile(rgb as u8);
+                ptr.add(1).write_volatile((rgb >> 8) as u8);
+                ptr.add(2).write_volatile((rgb >> 16) as u8);
             }
         }
     }
@@ -102,15 +125,29 @@ pub fn bench(label: &str) {
     // screen even on tiny resolutions, so this never touches memory
     // outside the framebuffer.
     let y0 = 16.min(height.saturating_sub(1));
+    if width == 0 || height == 0 {
+        return;
+    }
+    let writes = N.min(height.saturating_sub(y0).saturating_mul(width));
+    let mut original = [0u32; N];
 
     unsafe {
-        let start = rdtsc();
-        for i in 0..N {
+        // Save the pixels before timing so both the benchmark and its
+        // cleanup leave the displayed image unchanged.
+        for i in 0..writes {
             let x = i % width;
             let y = y0 + i / width;
-            if y >= height {
-                break;
-            }
+            let offset = y * (fb.pitch as usize) + x * bytes_per_pixel;
+            let ptr = fb.addr.add(offset);
+            original[i] = ptr.read_volatile() as u32
+                | ((ptr.add(1).read_volatile() as u32) << 8)
+                | ((ptr.add(2).read_volatile() as u32) << 16);
+        }
+
+        let start = rdtsc();
+        for i in 0..writes {
+            let x = i % width;
+            let y = y0 + i / width;
             let offset = y * (fb.pitch as usize) + x * bytes_per_pixel;
             let ptr = fb.addr.add(offset);
             ptr.write_volatile(0x55);
@@ -120,14 +157,25 @@ pub fn bench(label: &str) {
         let end = rdtsc();
         let cycles = end - start;
 
+        for i in 0..writes {
+            let x = i % width;
+            let y = y0 + i / width;
+            let offset = y * (fb.pitch as usize) + x * bytes_per_pixel;
+            let ptr = fb.addr.add(offset);
+            let rgb = original[i];
+            ptr.write_volatile(rgb as u8);
+            ptr.add(1).write_volatile((rgb >> 8) as u8);
+            ptr.add(2).write_volatile((rgb >> 16) as u8);
+        }
+
         crate::log_ok!(
             "Framebuffer",
             "Bench",
             "{}: {} pixel writes in {} cycles ({} cycles/pixel)",
             label,
-            N,
+            writes,
             cycles,
-            cycles / N as u64
+            cycles / writes.max(1) as u64
         );
     }
 }

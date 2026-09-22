@@ -56,6 +56,10 @@ pub struct Logger {
     early_count: usize,
 }
 
+/// Debug log lines are compiled into the kernel only for debug builds
+/// requested with `--debug` in the build scripts.
+const DEBUG_LOGS: bool = cfg!(feature = "debug-logs");
+
 pub static LOGGER: IrqMutex<Logger> = IrqMutex::new(Logger {
     use_color: true,
     early_buffer: [const { LogEntry { buf: [0; MAX_LINE_LEN], len: 0 } }; EARLY_LOG_CAPACITY],
@@ -83,6 +87,9 @@ fn emit<W: Write>(
 
 impl Logger {
     pub fn log(&mut self, module: &str, function: &str, output: fmt::Arguments, status: Status) {
+        if status == Status::Debug && !DEBUG_LOGS {
+            return;
+        }
         {
             let mut serial = SERIAL1.lock();
             emit(&mut *serial, self.use_color, module, function, output, status);

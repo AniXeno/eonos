@@ -4,9 +4,11 @@
 extern crate alloc;
 
 pub mod blocking;
+pub mod block;
 pub mod console;
 pub mod drivers;
 pub mod elf;
+pub mod fat32;
 pub mod framebuffer;
 pub mod gdt;
 pub mod heap;
@@ -23,6 +25,7 @@ pub mod serial;
 pub mod sync;
 pub mod syscall;
 pub mod vmm;
+pub mod vfs;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -98,6 +101,8 @@ unsafe extern "C" fn _start() -> ! {
     // this has to come after the VMM is up.
     initramfs::init();
     initramfs::self_test();
+    vfs::init();
+    fat32::mount_boot_volume();
 
     process::self_test();
     process::start_init();
