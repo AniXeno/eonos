@@ -6,7 +6,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::block::BlockDevice;
+use crate::block::{BlockDevice, PartitionDevice};
 use crate::fat32::{DirEntry, Fat32};
 use crate::sync::IrqMutex;
 
@@ -107,6 +107,18 @@ pub fn mount_fat32(prefix: &str, device: &'static dyn BlockDevice) -> Result<(),
     Ok(())
 }
 
+/// Mount a FAT32/vfat partition using partition-relative sector addresses.
+pub fn mount_fat32_partition(
+    prefix: &str,
+    parent: &'static dyn BlockDevice,
+    start_lba: u64,
+    sectors: u64,
+) -> Result<(), FsError> {
+    let partition = PartitionDevice::new(parent, start_lba, sectors).ok_or(FsError::InvalidPath)?;
+    let partition: &'static dyn BlockDevice = alloc::boxed::Box::leak(alloc::boxed::Box::new(partition));
+    mount_fat32(prefix, partition)
+}
+
 pub fn read_all(path: &str) -> Result<Vec<u8>, FsError> {
     let size = file_size(path)?;
     if size > MAX_READ_ALL {
@@ -205,6 +217,23 @@ pub fn file_size(path: &str) -> Result<usize, FsError> {
             }
         }
     }
+}
+
+/// Ask writable mounted filesystems to make pending writes durable.
+/// The default boot-image device keeps changes in RAM and reports ReadOnly.
+pub fn sync() -> Result<(), FsError> {
+    let mounts = MOUNTS.lock();
+    let mut found_writable_mount = false;
+    for mount in mounts.iter() {
+        if let Filesystem::Fat32(fs) = &mount.fs {
+            found_writable_mount = true;
+            fs.flush().map_err(|e| match e {
+                crate::block::BlockError::ReadOnly => FsError::ReadOnly,
+                _ => FsError::Io,
+            })?;
+        }
+    }
+    if found_writable_mount { Ok(()) } else { Err(FsError::ReadOnly) }
 }
 
 pub fn list(path: &str) -> Result<Vec<DirEntry>, FsError> {

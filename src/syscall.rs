@@ -218,12 +218,8 @@ pub const SYS_WAIT4: u64 = 61;
 pub const SYS_OPEN: u64 = 2;
 pub const SYS_CLOSE: u64 = 3;
 
-// EonOS-specific calls, well clear of Linux's own numbers, standing in
-// for a real filesystem (open/read/close on the initramfs) until one
-// exists. `list_files` writes a newline-separated listing; `read_file`
-// looks a path up by name and copies its whole contents in one shot --
-// no offsets, no partial reads. Both are stopgaps for the shell's
-// `ls`/`cat` and are expected to go away once EonOS has real fds.
+// EonOS-specific utilities used by the shell. File access itself uses
+// open/read/write/close; list/read-by-path remain compatibility helpers.
 pub const SYS_LIST_FILES: u64 = 9001;
 pub const SYS_READ_FILE: u64 = 9002;
 /// Milliseconds since boot, per `pit::uptime_ms()`. Backs the shell's
@@ -236,14 +232,30 @@ pub const SYS_EXEC: u64 = 9005;
 pub const SYS_LIST_PROCESSES: u64 = 9006;
 pub const SYS_MKDIR: u64 = 9007;
 pub const SYS_REMOVE: u64 = 9008;
+pub const SYS_SYNC: u64 = 9009;
+pub const SYS_LIST_BLOCK_DEVICES: u64 = 9010;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FdKind {
+    Stdin,
+    Stdout,
+    Stderr,
+    Console,
+    Null,
+    Zero,
+    Urandom,
+    File,
+}
 
 struct OpenFile {
     pid: u64,
     fd: u64,
+    kind: FdKind,
     path: alloc::string::String,
     offset: usize,
     readable: bool,
     writable: bool,
+    append: bool,
 }
 static OPEN_FILES: sync::IrqMutex<alloc::vec::Vec<OpenFile>> = sync::IrqMutex::new(alloc::vec::Vec::new());
 
@@ -262,11 +274,40 @@ const EEXIST: i64 = 17;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const ENOTEMPTY: i64 = 39;
+const ECHILD: i64 = 10;
+const E2BIG: i64 = 7;
+const ENOMEM: i64 = 12;
+const ENOEXEC: i64 = 8;
+const EAGAIN: i64 = 11;
 
 const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
 const O_CREAT: u64 = 0x40;
 const O_TRUNC: u64 = 0x200;
 const O_APPEND: u64 = 0x400;
+
+/// Install a fresh process's standard streams. Processes currently start
+/// independently, so there is no parent descriptor inheritance yet.
+pub fn init_process_files(pid: u64) {
+    let mut files = OPEN_FILES.lock();
+    files.retain(|file| file.pid != pid);
+    for (fd, kind, readable, writable) in [
+        (0, FdKind::Stdin, true, false),
+        (1, FdKind::Stdout, false, true),
+        (2, FdKind::Stderr, false, true),
+    ] {
+        files.push(OpenFile {
+            pid,
+            fd,
+            kind,
+            path: alloc::string::String::new(),
+            offset: 0,
+            readable,
+            writable,
+            append: false,
+        });
+    }
+}
 
 /// Encode a positive errno as the negative value a syscall returns.
 const fn errno(e: i64) -> u64 {
@@ -298,6 +339,51 @@ const HISTORY_CAP: usize = 32;
 
 static HISTORY: sync::IrqMutex<alloc::collections::VecDeque<alloc::vec::Vec<u8>>> =
     sync::IrqMutex::new(alloc::collections::VecDeque::new());
+static TERMINAL_READER: AtomicBool = AtomicBool::new(false);
+static URANDOM_STATE: AtomicU64 = AtomicU64::new(0);
+
+/// Get one pseudorandom word, preferring RDRAND when the CPU advertises it.
+/// The timing-seeded fallback is useful for non-cryptographic random data,
+/// but is not a cryptographic random number generator.
+fn urandom_word() -> u64 {
+    if core::arch::x86_64::__cpuid(1).ecx & (1 << 30) != 0 {
+        for _ in 0..10 {
+            let value: u64;
+            let ready: u8;
+            unsafe {
+                core::arch::asm!("rdrand {value}", "setc {ready}",
+                    value = lateout(reg) value, ready = lateout(reg_byte) ready,
+                    options(nomem, nostack));
+            }
+            if ready != 0 { return value; }
+        }
+    }
+    let mut old = URANDOM_STATE.load(Ordering::Relaxed);
+    loop {
+        let mut value = if old == 0 {
+            0x9E37_79B9_7F4A_7C15 ^ pit::uptime_ms().rotate_left(19) ^ scheduler::current_id()
+        } else { old };
+        let tsc_low: u32;
+        let tsc_high: u32;
+        unsafe { core::arch::asm!("rdtsc", out("eax") tsc_low, out("edx") tsc_high, options(nomem, nostack)); }
+        value ^= ((tsc_high as u64) << 32) | tsc_low as u64;
+        value ^= value >> 12;
+        value ^= value << 25;
+        value ^= value >> 27;
+        if value == 0 { value = 0xA076_1D64_78BD_642F; }
+        match URANDOM_STATE.compare_exchange_weak(old, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return value.wrapping_mul(0x2545_F491_4F6C_DD1D),
+            Err(actual) => old = actual,
+        }
+    }
+}
+
+fn fill_urandom(out: &mut [u8]) {
+    for chunk in out.chunks_mut(8) {
+        let bytes = urandom_word().to_ne_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+}
 
 /// Next raw input byte from whichever source has one, blocking
 /// (via yield, not a real wait queue) until one shows up. PS/2 and
@@ -573,35 +659,63 @@ fn read_line(max: usize) -> alloc::vec::Vec<u8> {
 }
 
 fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
-    if fd != 0 {
-        let pid = scheduler::current_id();
-        let mut files = OPEN_FILES.lock();
-        let Some(file) = files.iter_mut().find(|f| f.pid == pid && f.fd == fd) else { return errno(EBADF) };
-        if !file.readable { return errno(EBADF); }
-        let n = (len as usize).min(MAX_WRITE);
-        let mut data = alloc::vec![0; n];
-        let read = match crate::vfs::read_at(&file.path, file.offset, &mut data) {
-            Ok(n) => n,
-            Err(error) => return fs_errno(error),
-        };
-        if !vmm::copy_to_user(buf, &data[..read]) { return errno(EFAULT); }
-        file.offset += read;
-        return read as u64;
-    }
     let n = (len as usize).min(MAX_WRITE);
     if n == 0 {
         return 0;
     }
-    let line = read_line(n);
-    if !vmm::copy_to_user(buf, &line) {
+    let pid = scheduler::current_id();
+    let kind = {
+        let files = OPEN_FILES.lock();
+        let Some(file) = files.iter().find(|f| f.pid == pid && f.fd == fd) else { return errno(EBADF) };
+        if !file.readable { return errno(EBADF); }
+        file.kind
+    };
+    // Check the full destination before reading a file or consuming a
+    // console line. copy_to_user checks it again when it performs the copy.
+    if !vmm::validate_user_range(buf, n, true) {
         return errno(EFAULT);
     }
-    line.len() as u64
+    if kind == FdKind::Null { return 0; }
+    if kind == FdKind::Zero {
+        let data = alloc::vec![0; n];
+        if !vmm::copy_to_user(buf, &data) { return errno(EFAULT); }
+        return n as u64;
+    }
+    if kind == FdKind::Urandom {
+        let mut data = alloc::vec![0; n];
+        fill_urandom(&mut data);
+        if !vmm::copy_to_user(buf, &data) { return errno(EFAULT); }
+        return n as u64;
+    }
+    if matches!(kind, FdKind::Stdin | FdKind::Console) {
+        while TERMINAL_READER.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            scheduler::yield_now();
+        }
+        let line = read_line(n);
+        TERMINAL_READER.store(false, Ordering::Release);
+        if !vmm::copy_to_user(buf, &line) { return errno(EFAULT); }
+        return line.len() as u64;
+    }
+    if kind != FdKind::File { return errno(EBADF); }
+    let mut files = OPEN_FILES.lock();
+    let Some(file) = files.iter_mut().find(|f| f.pid == pid && f.fd == fd) else { return errno(EBADF) };
+    let mut data = alloc::vec![0; n];
+    let read = match crate::vfs::read_at(&file.path, file.offset, &mut data) {
+        Ok(n) => n,
+        Err(error) => return fs_errno(error),
+    };
+    if !vmm::copy_to_user(buf, &data[..read]) { return errno(EFAULT); }
+    file.offset += read;
+    read as u64
 }
 
 fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
-    let allowed = O_WRONLY | O_CREAT | O_TRUNC | O_APPEND;
-    if flags & !allowed != 0 || flags & O_TRUNC != 0 && flags & O_WRONLY == 0 {
+    let access = flags & 3;
+    let allowed = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND;
+    if flags & !allowed != 0
+        || access == (O_WRONLY | O_RDWR)
+        || flags & (O_TRUNC | O_APPEND) != 0 && access == 0
+    {
         return errno(EINVAL);
     }
     let n = path_len as usize;
@@ -609,6 +723,25 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     let mut path = alloc::vec![0; n];
     if !vmm::copy_from_user(&mut path, path_ptr) { return errno(EFAULT); }
     let Ok(path) = core::str::from_utf8(&path) else { return errno(ENOENT) };
+    let device = match path {
+        "/device/console" => Some(FdKind::Console),
+        "/device/null" => Some(FdKind::Null),
+        "/device/zero" => Some(FdKind::Zero),
+        "/device/urandom" => Some(FdKind::Urandom),
+        _ => None,
+    };
+    if let Some(kind) = device {
+        if flags & (O_CREAT | O_TRUNC | O_APPEND) != 0 { return errno(EINVAL); }
+        let pid = scheduler::current_id();
+        let mut files = OPEN_FILES.lock();
+        let fd = (3..).find(|fd| !files.iter().any(|f| f.pid == pid && f.fd == *fd)).unwrap_or(3);
+        files.push(OpenFile { pid, fd, kind, path: alloc::string::String::new(), offset: 0,
+            readable: access == 0 || access == O_RDWR,
+            writable: access == O_WRONLY || access == O_RDWR,
+            append: false,
+        });
+        return fd;
+    }
     let size = match crate::vfs::file_size(path) {
         Ok(size) => size,
         Err(_) if flags & O_CREAT != 0 => {
@@ -629,8 +762,10 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
         fd,
         path: alloc::string::String::from(path),
         offset,
-        readable: flags & O_WRONLY == 0,
-        writable: flags & O_WRONLY != 0,
+        kind: FdKind::File,
+        readable: access == 0 || access == O_RDWR,
+        writable: access == O_WRONLY || access == O_RDWR,
+        append: flags & O_APPEND != 0,
     });
     fd
 }
@@ -655,13 +790,51 @@ fn sys_kill(pid: u64, signal: u64) -> u64 {
     }
 }
 
-fn sys_exec(path_ptr: u64, path_len: u64) -> u64 {
+fn copy_user_string(ptr: u64) -> Result<alloc::string::String, u64> {
+    let mut bytes = alloc::vec::Vec::new();
+    for i in 0..=MAX_NAME {
+        let mut byte = [0u8; 1];
+        let address = ptr.checked_add(i as u64).ok_or(errno(EFAULT))?;
+        if !vmm::copy_from_user(&mut byte, address) { return Err(errno(EFAULT)); }
+        if byte[0] == 0 {
+            return core::str::from_utf8(&bytes).map(alloc::string::String::from).map_err(|_| errno(EINVAL));
+        }
+        if i == MAX_NAME { return Err(errno(ENAMETOOLONG)); }
+        bytes.push(byte[0]);
+    }
+    Err(errno(ENAMETOOLONG))
+}
+
+fn copy_user_vector(ptr: u64, fallback: Option<alloc::string::String>) -> Result<alloc::vec::Vec<alloc::string::String>, u64> {
+    if ptr == 0 { return Ok(fallback.into_iter().collect()); }
+    let mut values = alloc::vec::Vec::new();
+    for i in 0..32usize {
+        let mut raw = [0u8; 8];
+        let address = ptr.checked_add((i * 8) as u64).ok_or(errno(EFAULT))?;
+        if !vmm::copy_from_user(&mut raw, address) { return Err(errno(EFAULT)); }
+        let string_ptr = u64::from_ne_bytes(raw);
+        if string_ptr == 0 { return Ok(values); }
+        values.push(copy_user_string(string_ptr)?);
+    }
+    Err(errno(E2BIG))
+}
+
+fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, env_ptr: u64) -> u64 {
     let n = path_len as usize;
     if n > MAX_NAME { return errno(ENAMETOOLONG); }
     let mut path = alloc::vec![0; n];
     if !vmm::copy_from_user(&mut path, path_ptr) { return errno(EFAULT); }
     let Ok(path) = core::str::from_utf8(&path) else { return errno(ENOENT) };
-    match process::spawn(path) { Ok(pid) => pid, Err(_) => errno(ENOENT) }
+    let path = alloc::string::String::from(path);
+    let argv = match copy_user_vector(argv_ptr, Some(path.clone())) { Ok(v) => v, Err(e) => return e };
+    let env = match copy_user_vector(env_ptr, None) { Ok(v) => v, Err(e) => return e };
+    match process::spawn_with(&path, &argv, &env) {
+        Ok(pid) => pid,
+        Err(process::SpawnError::NotFound) => errno(ENOENT),
+        Err(process::SpawnError::Elf(_)) => errno(ENOEXEC),
+        Err(process::SpawnError::NoMemory) => errno(ENOMEM),
+        Err(process::SpawnError::NoThread) => errno(EAGAIN),
+    }
 }
 
 fn sys_path_mutation(path_ptr: u64, path_len: u64, make_dir: bool) -> u64 {
@@ -674,17 +847,33 @@ fn sys_path_mutation(path_ptr: u64, path_len: u64, make_dir: bool) -> u64 {
     match result { Ok(()) => 0, Err(error) => fs_errno(error) }
 }
 
-fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
+fn sys_sync() -> u64 {
+    match crate::vfs::sync() { Ok(()) => 0, Err(error) => fs_errno(error) }
+}
+
+fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
+    const WNOHANG: u64 = 1;
+    if options & !WNOHANG != 0 { return errno(EINVAL); }
+    // Reaping is destructive, so reject a bad status pointer before waiting
+    // for or removing the child's exit status.
+    if status_ptr != 0 && !vmm::validate_user_range(status_ptr, 4, true) {
+        return errno(EFAULT);
+    }
     loop {
-        if let Some(status) = process::take_exit_status(pid) {
-            if status_ptr != 0 && !vmm::copy_to_user(status_ptr, &(status as i32).to_ne_bytes()) { return errno(EFAULT); }
-            return pid;
+        match process::take_child_exit_status(scheduler::current_id(), pid) {
+            Err(()) => return errno(ECHILD),
+            Ok(Some((child_pid, status))) => {
+                if status_ptr != 0 && !vmm::copy_to_user(status_ptr, &(status as i32).to_ne_bytes()) { return errno(EFAULT); }
+                return child_pid;
+            }
+            Ok(None) if options & WNOHANG != 0 => return 0,
+            Ok(None) => {}
         }
         scheduler::yield_now();
     }
 }
 
-/// Longest path/file name the file stopgap syscalls accept.
+/// Longest path or argument string accepted by user-facing syscalls.
 const MAX_NAME: usize = 255;
 
 fn sys_list_files(buf: u64, len: u64) -> u64 {
@@ -721,6 +910,54 @@ fn sys_list_processes(buf: u64, len: u64) -> u64 {
     output.len() as u64
 }
 
+fn sys_list_block_devices(buf: u64, len: u64) -> u64 {
+    let cap = (len as usize).min(MAX_WRITE);
+    let mut output = alloc::string::String::from("NAME        FSTYPE FSVER LABEL        UUID                                 FSAVAIL FSUSE% MOUNTPOINTS\n");
+    for registered in crate::block::devices() {
+        let device = registered.device;
+        let info = crate::fs_probe::inspect(device);
+        let mountpoint = if registered.name == "ram0" { "/disk" } else { "" };
+        write_lsblk_row(&mut output, registered.name, &info, mountpoint, "");
+        if let Ok(parts) = crate::partition::scan(device) {
+            for (i, part) in parts.iter().enumerate() {
+                let view = crate::block::PartitionDevice::new(device, part.start_lba, part.sectors);
+                if let Some(view) = view {
+                    let info = crate::fs_probe::inspect(&view);
+                    let separator = if i + 1 == parts.len() { "└─" } else { "├─" };
+                    let part_name = if registered.name.starts_with("nvme") { alloc::format!("{}p{}", registered.name, part.index) } else { alloc::format!("{}{}", registered.name, part.index) };
+                    write_lsblk_row(&mut output, &part_name, &info, "", separator);
+                }
+            }
+        }
+    }
+    if output.len() > cap { return errno(ERANGE); }
+    if !vmm::copy_to_user(buf, output.as_bytes()) { return errno(EFAULT); }
+    output.len() as u64
+}
+
+fn write_lsblk_row(out: &mut alloc::string::String, name: &str, info: &crate::fs_probe::FsInfo, mount: &str, tree: &str) {
+    use core::fmt::Write;
+    let fstype = match info.kind {
+        crate::fs_probe::FsType::Fat32 | crate::fs_probe::FsType::Vfat => "vfat",
+        crate::fs_probe::FsType::Unknown => "",
+        other => other.name(),
+    };
+    let available = info.available.map(format_lsblk_size).unwrap_or_default();
+    let used = info.used_percent.map(|n| alloc::format!("{}%", n)).unwrap_or_default();
+    let _ = writeln!(out, "{}{:<10} {:<6} {:<5} {:<12} {:<36} {:>7} {:>6} {}", tree, name, fstype, info.version, info.label, info.uuid, available, used, mount);
+}
+
+fn format_lsblk_size(bytes: u64) -> alloc::string::String {
+    const UNITS: [(&str, u64); 4] = [("T", 1u64 << 40), ("G", 1u64 << 30), ("M", 1u64 << 20), ("K", 1u64 << 10)];
+    for (unit, base) in UNITS {
+        if bytes >= base {
+            let tenths = bytes.saturating_mul(10) / base;
+            return if tenths % 10 == 0 { alloc::format!("{}{}", tenths / 10, unit) } else { alloc::format!("{}.{}{}", tenths / 10, tenths % 10, unit) };
+        }
+    }
+    alloc::format!("{}B", bytes)
+}
+
 fn sys_read_file(name_ptr: u64, name_len: u64, buf: u64, buf_len: u64) -> u64 {
     let name_len = name_len as usize;
     if name_len > MAX_NAME {
@@ -751,28 +988,40 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     if n == 0 {
         return 0;
     }
+    let pid = scheduler::current_id();
+    let (kind, path, offset, append) = {
+        let files = OPEN_FILES.lock();
+        let Some(file) = files.iter().find(|f| f.pid == pid && f.fd == fd) else { return errno(EBADF) };
+        if !file.writable { return errno(EBADF); }
+        (file.kind, file.path.clone(), file.offset, file.append)
+    };
     let mut data = alloc::vec![0u8; n];
     if !vmm::copy_from_user(&mut data, buf) {
         return errno(EFAULT);
     }
-    if fd == 1 || fd == 2 {
+    if matches!(kind, FdKind::Stdout | FdKind::Stderr | FdKind::Console) {
         console_write(&data);
         return n as u64;
     }
-    let pid = scheduler::current_id();
-    let (path, offset) = {
-        let files = OPEN_FILES.lock();
-        let Some(file) = files.iter().find(|f| f.pid == pid && f.fd == fd) else { return errno(EBADF) };
-        if !file.writable { return errno(EBADF); }
-        (file.path.clone(), file.offset)
+    if matches!(kind, FdKind::Null | FdKind::Zero | FdKind::Urandom) { return n as u64; }
+    if kind != FdKind::File { return errno(EBADF); }
+    // Serialize append's size lookup and write against other descriptor
+    // writes so concurrent appends cannot select the same offset.
+    let mut files = OPEN_FILES.lock();
+    let Some(file) = files.iter_mut().find(|f| f.pid == pid && f.fd == fd) else { return errno(EBADF) };
+    let offset = if append {
+        match crate::vfs::file_size(&path) {
+            Ok(size) => size,
+            Err(error) => return fs_errno(error),
+        }
+    } else {
+        offset
     };
     let written = match crate::vfs::write_at(&path, offset, &data) {
         Ok(written) => written,
         Err(error) => return fs_errno(error),
     };
-    if let Some(file) = OPEN_FILES.lock().iter_mut().find(|f| f.pid == pid && f.fd == fd) {
-        file.offset += written;
-    }
+    file.offset = offset + written;
     written as u64
 }
 
@@ -806,13 +1055,15 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
         SYS_WRITE => frame.rax = sys_write(frame.rdi, frame.rsi, frame.rdx),
         SYS_LIST_FILES => frame.rax = sys_list_files(frame.rdi, frame.rsi),
         SYS_LIST_PROCESSES => frame.rax = sys_list_processes(frame.rdi, frame.rsi),
+        SYS_LIST_BLOCK_DEVICES => frame.rax = sys_list_block_devices(frame.rdi, frame.rsi),
         SYS_MKDIR => frame.rax = sys_path_mutation(frame.rdi, frame.rsi, true),
         SYS_REMOVE => frame.rax = sys_path_mutation(frame.rdi, frame.rsi, false),
+        SYS_SYNC => frame.rax = sys_sync(),
         SYS_READ_FILE => frame.rax = sys_read_file(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         SYS_UPTIME_MS => frame.rax = pit::uptime_ms(),
         SYS_SLEEP_MS => { scheduler::sleep_ms(frame.rdi); frame.rax = 0; }
-        SYS_EXEC => frame.rax = sys_exec(frame.rdi, frame.rsi),
-        SYS_WAIT4 => frame.rax = sys_waitpid(frame.rdi, frame.rdx),
+        SYS_EXEC => frame.rax = sys_exec(frame.rdi, frame.rsi, frame.rdx, frame.r10),
+        SYS_WAIT4 => frame.rax = sys_waitpid(frame.rdi, frame.rsi, frame.rdx),
         62 => frame.rax = sys_kill(frame.rdi, frame.rsi),
         SYS_SCHED_YIELD => {
             scheduler::yield_now();

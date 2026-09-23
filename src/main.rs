@@ -9,6 +9,7 @@ pub mod acpi;
 pub mod console;
 pub mod drivers;
 pub mod elf;
+pub mod fs_probe;
 pub mod fat32;
 pub mod framebuffer;
 pub mod gdt;
@@ -23,6 +24,7 @@ pub mod panic_screen;
 pub mod pic;
 pub mod pit;
 pub mod pmm;
+pub mod partition;
 pub mod process;
 pub mod scheduler;
 pub mod serial;
@@ -107,6 +109,8 @@ unsafe extern "C" fn _start() -> ! {
     // command doesn't have to wait on anything else finishing init.
     drivers::ps2::init();
     drivers::usb::init();
+    drivers::ahci::init();
+    drivers::nvme::init();
 
     scheduler::init();
     scheduler::self_test();

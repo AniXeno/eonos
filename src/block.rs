@@ -5,6 +5,24 @@
 use crate::fat32::SECTOR_SIZE;
 use crate::sync::IrqMutex;
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
+#[derive(Clone, Copy)]
+pub struct RegisteredDevice {
+    pub name: &'static str,
+    pub device: &'static dyn BlockDevice,
+}
+
+static DEVICES: IrqMutex<Vec<RegisteredDevice>> = IrqMutex::new(Vec::new());
+
+/// Publish a block device to kernel tools such as `lsblk`.
+pub fn register_device(name: &'static str, device: &'static dyn BlockDevice) {
+    let mut devices = DEVICES.lock();
+    if devices.iter().any(|entry| entry.name == name) { return; }
+    devices.push(RegisteredDevice { name, device });
+}
+
+pub fn devices() -> Vec<RegisteredDevice> { DEVICES.lock().clone() }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockError {
@@ -19,6 +37,42 @@ pub trait BlockDevice: Send + Sync {
     fn write_sector(&self, _lba: u64, _data: &[u8; SECTOR_SIZE]) -> Result<(), BlockError> {
         Err(BlockError::ReadOnly)
     }
+    /// Make completed writes durable when the backing device supports it.
+    fn flush(&self) -> Result<(), BlockError> { Err(BlockError::ReadOnly) }
+}
+
+/// A bounded view of a partition on a parent block device.
+/// All filesystem LBAs are relative to the partition start.
+pub struct PartitionDevice {
+    parent: &'static dyn BlockDevice,
+    start_lba: u64,
+    sectors: u64,
+}
+
+impl PartitionDevice {
+    pub fn new(parent: &'static dyn BlockDevice, start_lba: u64, sectors: u64) -> Option<Self> {
+        let end = start_lba.checked_add(sectors)?;
+        if sectors == 0 || end > parent.sector_count() {
+            return None;
+        }
+        Some(Self { parent, start_lba, sectors })
+    }
+}
+
+impl BlockDevice for PartitionDevice {
+    fn sector_count(&self) -> u64 { self.sectors }
+
+    fn read_sector(&self, lba: u64, out: &mut [u8; SECTOR_SIZE]) -> Result<(), BlockError> {
+        if lba >= self.sectors { return Err(BlockError::OutOfRange); }
+        self.parent.read_sector(self.start_lba + lba, out)
+    }
+
+    fn write_sector(&self, lba: u64, data: &[u8; SECTOR_SIZE]) -> Result<(), BlockError> {
+        if lba >= self.sectors { return Err(BlockError::OutOfRange); }
+        self.parent.write_sector(self.start_lba + lba, data)
+    }
+
+    fn flush(&self) -> Result<(), BlockError> { self.parent.flush() }
 }
 
 /// A block device backed by a Limine-loaded image. Writes are kept in a

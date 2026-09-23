@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and Run EonOS in QEMU. Serial output goes to your terminal.
+# Build and run EonOS in QEMU with USB keyboard input. Serial output goes to your terminal.
 set -euo pipefail
 
 if [ "$#" -eq 1 ] && [ "$1" = "--debug" ]; then

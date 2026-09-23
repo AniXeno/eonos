@@ -160,6 +160,15 @@ unsafe fn read_data() -> Option<u8> {
 /// (once it exists) may be the only input path on such a machine.
 pub fn init() {
     unsafe {
+        // An absent 8042 can return 0xFF from its unmapped status port.
+        // In particular, QEMU returns this when started with
+        // `-machine ...,i8042=off`; recognize it before trying to drain
+        // the output buffer, whose full bit would otherwise look stuck.
+        if inb(STATUS_PORT) == 0xFF {
+            log_ok!("PS2", "Init", "No PS/2 controller detected; continuing without it");
+            return;
+        }
+
         // Disable both ports first: a stray byte arriving mid-init
         // (from a mouse on port 2, or a keyboard that was already
         // sending) would otherwise be misread as a command response.
@@ -168,7 +177,10 @@ pub fn init() {
 
         // Flush anything left in the output buffer from before we took
         // over (firmware POST, a previous OS, ...).
-        while inb(STATUS_PORT) & STATUS_OUTPUT_FULL != 0 {
+        for _ in 0..100_000 {
+            if inb(STATUS_PORT) & STATUS_OUTPUT_FULL == 0 {
+                break;
+            }
             inb(DATA_PORT);
         }
 

@@ -12,3 +12,5 @@
 
 pub mod ps2;
 pub mod usb;
+pub mod ahci;
+pub mod nvme;

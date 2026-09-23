@@ -150,6 +150,8 @@ impl Fat32 {
         self.device.write_sector(lba, data).map_err(|_| FatError::Io)
     }
 
+    pub fn flush(&self) -> Result<(), crate::block::BlockError> { self.device.flush() }
+
     fn invalidate_fsinfo_hint(&self) -> Result<(), FatError> {
         if self.fsinfo_invalidated.load(Ordering::Acquire) {
             return Ok(());
@@ -906,6 +908,7 @@ pub fn mount_boot_volume() {
         return;
     };
     let device: &'static dyn BlockDevice = alloc::boxed::Box::leak(alloc::boxed::Box::new(device));
+    crate::block::register_device("ram0", device);
     match crate::vfs::mount_fat32("/disk", device) {
         Ok(()) => log_ok!(
             "FAT32",

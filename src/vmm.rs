@@ -612,10 +612,14 @@ impl AddressSpace {
     /// Only valid for `virt < 0x0000_8000_0000_0000` (user space); use
     /// the free-standing `vmm::map_page` for kernel addresses instead.
     pub fn map(&self, virt: u64, phys: u64, flags: u64) {
-        debug_assert!(
-            index_of_top_level(virt) < KERNEL_PML4_START,
-            "AddressSpace::map called with a kernel-half address; use vmm::map_page"
+        assert!(virt < USER_SPACE_END, "user mapping outside user address space");
+        assert_eq!(virt & (PAGE_SIZE - 1), 0, "user virtual address is not page-aligned");
+        assert_eq!(phys & (PAGE_SIZE - 1), 0, "user physical address is not page-aligned");
+        assert!(
+            matches!(flags, USER_RX | USER_RO | USER_RW),
+            "unsupported user page permissions"
         );
+        assert!(self.translate(virt).is_none(), "user mapping would replace an owned page");
         unsafe {
             map4k(table_ptr(self.pml4_phys), virt, phys, flags);
             // Only meaningful while this space is the active one, but
@@ -640,10 +644,6 @@ impl Drop for AddressSpace {
     fn drop(&mut self) {
         unsafe { free_user_half(self.pml4_phys) };
     }
-}
-
-fn index_of_top_level(virt: u64) -> usize {
-    index(virt, 0)
 }
 
 unsafe fn free_user_half(pml4_phys: u64) {
@@ -732,8 +732,8 @@ unsafe fn walk_user(pml4_phys: u64, virt: u64) -> Option<u64> {
 }
 
 /// Copy `dst.len()` bytes from the *current* address space's user
-/// memory at `src` into `dst`. Returns `false` (leaving `dst` partly
-/// written) if any part of the range is outside user space or not
+/// memory at `src` into `dst`. Returns `false` without copying if any
+/// part of the range is outside user space or not
 /// mapped user-accessible.
 ///
 /// This never dereferences the user pointer: it walks the page tables in
@@ -741,13 +741,7 @@ unsafe fn walk_user(pml4_phys: u64, virt: u64) -> Option<u64> {
 /// bad pointer from a process is a clean `false` here instead of a
 /// kernel-mode page fault (which would panic the whole kernel).
 pub fn copy_from_user(dst: &mut [u8], src: u64) -> bool {
-    if dst.is_empty() {
-        return true;
-    }
-    let Some(end) = src.checked_add(dst.len() as u64) else {
-        return false;
-    };
-    if end > USER_SPACE_END {
+    if !validate_user_range(src, dst.len(), false) {
         return false;
     }
 
@@ -773,20 +767,14 @@ pub fn copy_from_user(dst: &mut [u8], src: u64) -> bool {
 }
 
 /// Copy `src` into the *current* address space's user memory at `dst`.
-/// Returns `false` (leaving the destination partly written) if any part
+/// Returns `false` without copying if any part
 /// of the range is outside user space or not mapped user-writable.
 ///
 /// Mirror image of `copy_from_user`: same software page-table walk
 /// through the direct map, so a bad or read-only pointer from a process
 /// is a clean `false` here instead of a kernel-mode page fault.
 pub fn copy_to_user(dst: u64, src: &[u8]) -> bool {
-    if src.is_empty() {
-        return true;
-    }
-    let Some(end) = dst.checked_add(src.len() as u64) else {
-        return false;
-    };
-    if end > USER_SPACE_END {
+    if !validate_user_range(dst, src.len(), true) {
         return false;
     }
 
@@ -807,6 +795,39 @@ pub fn copy_to_user(dst: u64, src: &[u8]) -> bool {
             );
         }
         done += n;
+    }
+    true
+}
+
+/// Validate a complete user memory range before any part of it is copied.
+/// This keeps failed copies from partially changing kernel buffers or user
+/// memory, and lets syscalls validate output buffers before consuming input
+/// or otherwise committing side effects.
+pub fn validate_user_range(addr: u64, len: usize, write: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = addr.checked_add(len as u64) else {
+        return false;
+    };
+    if addr >= USER_SPACE_END || end > USER_SPACE_END {
+        return false;
+    }
+
+    let pml4 = current_cr3();
+    let mut va = addr;
+    while va < end {
+        let mapped = unsafe {
+            if write { walk_user_write(pml4, va) } else { walk_user(pml4, va) }
+        };
+        if mapped.is_none() {
+            return false;
+        }
+        let next_page = (va & !(PAGE_SIZE - 1)).saturating_add(PAGE_SIZE);
+        if next_page <= va {
+            return false;
+        }
+        va = next_page.min(end);
     }
     true
 }

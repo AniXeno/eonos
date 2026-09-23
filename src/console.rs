@@ -23,6 +23,7 @@ pub static CONSOLE: IrqMutex<Option<Console>> = IrqMutex::new(None);
 #[derive(Clone, Copy)]
 struct Font {
     glyphs: &'static [u8],
+    unicode_table: &'static [u8],
     num_glyphs: usize,
     charsize: usize,
     width: usize,
@@ -32,15 +33,15 @@ struct Font {
 
 impl Font {
     fn parse(data: &'static [u8]) -> Option<Font> {
-        let (headersize, num_glyphs, charsize, width, height) =
+        let (headersize, num_glyphs, charsize, width, height, has_unicode_table) =
             if data.len() >= 32 && data.starts_with(&[0x72, 0xb5, 0x4a, 0x86]) {
                 let rd = |o: usize| {
                     u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize
                 };
-                (rd(8), rd(16), rd(20), rd(28), rd(24))
+                (rd(8), rd(16), rd(20), rd(28), rd(24), rd(12) & 1 != 0)
             } else if data.len() >= 4 && data[0] == 0x36 && data[1] == 0x04 {
                 let num = if data[2] & 1 != 0 { 512 } else { 256 };
-                (4, num, data[3] as usize, 8, data[3] as usize)
+                (4, num, data[3] as usize, 8, data[3] as usize, false)
             } else {
                 return None;
             };
@@ -53,9 +54,15 @@ impl Font {
         if end > data.len() {
             return None;
         }
+        let unicode_table = if has_unicode_table {
+            &data[end..]
+        } else {
+            &data[end..end]
+        };
 
         Some(Font {
             glyphs: &data[headersize..end],
+            unicode_table,
             num_glyphs,
             charsize,
             width,
@@ -66,6 +73,20 @@ impl Font {
 
     fn glyph(&self, ch: char) -> &'static [u8] {
         let mut idx = ch as usize;
+        if !self.unicode_table.is_empty() {
+            let mut encoded_buf = [0; 4];
+            let encoded = ch.encode_utf8(&mut encoded_buf);
+            let mut start = 0;
+            for glyph_idx in 0..self.num_glyphs {
+                let Some(relative_end) = self.unicode_table[start..].iter().position(|&b| b == 0xff) else { break };
+                let end = start + relative_end;
+                if self.unicode_table.get(start..end) == Some(encoded.as_bytes()) {
+                    idx = glyph_idx;
+                    break;
+                }
+                start = end + 1;
+            }
+        }
         if idx >= self.num_glyphs {
             idx = '?' as usize;
         }

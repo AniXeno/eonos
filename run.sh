@@ -22,8 +22,23 @@ fi
 
 UEFI="${UEFI:-1}"
 
+NEEDS_BUILD=0
 if [ ! -f "$ISO_PATH" ]; then
-    echo "No built ISO found, building it first..."
+    NEEDS_BUILD=1
+elif [ -n "$(find src userland initramfs tools -type f -newer "$ISO_PATH" -print -quit)" ]; then
+    NEEDS_BUILD=1
+else
+    for source in README.md Cargo.toml Cargo.lock build.sh limine.conf linker.ld \
+        x86_64-eonos.json baseline-target.json font.psf .cargo/config.toml; do
+        if [ -f "$source" ] && [ "$source" -nt "$ISO_PATH" ]; then
+            NEEDS_BUILD=1
+            break
+        fi
+    done
+fi
+
+if [ "$NEEDS_BUILD" = "1" ]; then
+    echo "No current ISO found, building it first..."
     if [ "$DEBUG_BUILD" = "1" ]; then
         ./build.sh --debug
     else
@@ -32,12 +47,15 @@ if [ ! -f "$ISO_PATH" ]; then
 fi
 
 ARGS=(
-    -M q35
+    # Disable the emulated i8042 so keyboard input must come through USB.
+    -M q35,i8042=off
     -vga std
     -m 2G
     -serial stdio
     -cdrom "$ISO_PATH"
     -boot d
+    -device qemu-xhci,id=xhci
+    -device usb-kbd,bus=xhci.0
 )
 
 if [ "$UEFI" = "1" ]; then
@@ -64,6 +82,15 @@ if [ "$UEFI" = "1" ]; then
     ARGS+=(
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE"
         -drive if=pflash,format=raw,file="$VARS_FILE"
+    )
+fi
+
+# Optional raw NVMe passthrough for lsblk development. Keep this read-only:
+# the current EonOS storage drivers intentionally do not issue disk writes.
+if [ -n "${EONOS_NVME_DISK:-}" ]; then
+    ARGS+=(
+        -drive "file=$EONOS_NVME_DISK,format=raw,if=none,id=eonos_nvme,readonly=on,aio=threads,file.locking=off"
+        -device nvme,drive=eonos_nvme,serial=EONOSNVME0001
     )
 fi
 

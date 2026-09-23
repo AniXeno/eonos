@@ -45,6 +45,7 @@ const INIT_TIMEOUT_MS: u64 = 5000;
 
 struct Record {
     pid: u64,
+    parent: u64,
     name: String,
     /// `None` while running, `Some(status)` once it has exited.
     status: Option<i64>,
@@ -61,7 +62,7 @@ static PROCS: IrqMutex<Vec<Record>> = IrqMutex::new(Vec::new());
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpawnError {
-    /// No such file in the initramfs.
+    /// No such executable in the mounted filesystems.
     NotFound,
     /// The file isn't a loadable executable.
     Elf(ElfError),
@@ -81,16 +82,17 @@ impl fmt::Display for SpawnError {
     }
 }
 
-/// Note that `pid` is running `name`. If the process has already run and
-/// exited by the time we get here (the scheduler may preempt us between
-/// creating the thread and this call), its record exists already and
-/// only needs its name filled in.
-fn register(pid: u64, name: &str) {
+/// Record the new process and its parent before the scheduler can run it.
+fn register(pid: u64, parent: u64, name: &str) {
     let mut procs = PROCS.lock();
     match procs.iter().position(|r| r.pid == pid) {
-        Some(i) => procs[i].name = String::from(name),
+        Some(i) => {
+            procs[i].parent = parent;
+            procs[i].name = String::from(name);
+        }
         None => procs.push(Record {
             pid,
+            parent,
             name: String::from(name),
             status: None,
         }),
@@ -113,6 +115,7 @@ pub fn exit_current(code: i64) -> ! {
             None => {
                 procs.push(Record {
                     pid,
+                    parent: 0,
                     name: String::new(),
                     status: Some(code),
                 });
@@ -131,6 +134,19 @@ pub fn take_exit_status(pid: u64) -> Option<i64> {
         .iter()
         .position(|r| r.pid == pid && r.status.is_some())?;
     procs.swap_remove(i).status
+}
+
+/// Reap a completed child, or report whether the caller has any such child.
+pub fn take_child_exit_status(parent: u64, pid: u64) -> Result<Option<(u64, i64)>, ()> {
+    let mut procs = PROCS.lock();
+    let any = pid == u64::MAX || pid == 0;
+    let has_child = procs.iter().any(|r| r.parent == parent && (any || r.pid == pid));
+    if !has_child { return Err(()); }
+    let exited = procs.iter().position(|r| r.parent == parent && (any || r.pid == pid) && r.status.is_some());
+    Ok(exited.map(|i| {
+        let record = procs.swap_remove(i);
+        (record.pid, record.status.unwrap())
+    }))
 }
 
 /// Return a snapshot without keeping the process-table lock held while
@@ -153,15 +169,16 @@ pub fn list() -> Vec<ProcessInfo> {
 /// ```text
 ///   rsp -> argc
 ///          argv[0] ... argv[argc-1], NULL
-///          envp[0] ... NULL            (none)
-///          auxv: AT_NULL               (none)
-///          ... argument strings ...
+///          envp[0] ... NULL
+///          auxv: AT_NULL (key, value)
+///          ... argument and environment strings ...
 /// ```
 ///
-/// with `rsp` 16-byte aligned. Returns the initial stack pointer, or
+/// with `rsp` 16-byte aligned. Strings are copied into the child address
+/// space. Returns the initial stack pointer, or
 /// `None` if out of memory. Every frame is mapped the moment it is
 /// allocated, so on failure the address space frees whatever was done.
-fn build_stack(aspace: &vmm::AddressSpace, arg0: &str) -> Option<u64> {
+fn build_stack(aspace: &vmm::AddressSpace, argv: &[String], env: &[String]) -> Option<u64> {
     let mut top_frame = 0u64;
     for i in 0..USER_STACK_PAGES {
         let phys = pmm::alloc_frame_zeroed()?;
@@ -181,15 +198,29 @@ fn build_stack(aspace: &vmm::AddressSpace, arg0: &str) -> Option<u64> {
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.add(off), bytes.len()) };
     };
 
-    let name = arg0.as_bytes();
-    let name = &name[..name.len().min(255)];
-    // The page is zeroed, so the string's NUL terminator is already there.
-    let str_addr = USER_STACK_TOP - (name.len() as u64 + 1);
-    write(str_addr, name);
-
-    // argc, argv[0], argv terminator, envp terminator, auxv AT_NULL (key, value)
-    let words: [u64; 6] = [1, str_addr, 0, 0, 0, 0];
-    let sp = (str_addr & !0xF) - (words.len() as u64) * 8;
+    let mut cursor = USER_STACK_TOP;
+    let mut argv_ptrs = Vec::with_capacity(argv.len());
+    let mut env_ptrs = Vec::with_capacity(env.len());
+    for (values, ptrs) in [(argv, &mut argv_ptrs), (env, &mut env_ptrs)] {
+        for value in values.iter().rev() {
+            let bytes = value.as_bytes();
+            if bytes.len() > 255 { return None; }
+            cursor = cursor.checked_sub(bytes.len() as u64 + 1)?;
+            if cursor < page_base { return None; }
+            write(cursor, bytes);
+            ptrs.push(cursor);
+        }
+        ptrs.reverse();
+    }
+    let mut words = Vec::with_capacity(1 + argv.len() + 1 + env.len() + 1 + 2);
+    words.push(argv.len() as u64);
+    words.extend(argv_ptrs);
+    words.push(0);
+    words.extend(env_ptrs);
+    words.extend([0, 0, 0]); // envp terminator and AT_NULL pair
+    let word_bytes = words.len() as u64 * 8;
+    let sp = cursor.checked_sub(word_bytes)? & !0xF;
+    if sp < page_base { return None; }
     for (i, w) in words.iter().enumerate() {
         write(sp + i as u64 * 8, &w.to_le_bytes());
     }
@@ -199,16 +230,35 @@ fn build_stack(aspace: &vmm::AddressSpace, arg0: &str) -> Option<u64> {
 /// Start the executable at `path` in the initramfs as a new process and
 /// return its pid.
 pub fn spawn(path: &str) -> Result<u64, SpawnError> {
+    let mut argv = Vec::new();
+    argv.push(String::from(path));
+    spawn_with(path, &argv, &[])
+}
+
+/// Launch an executable with its argument and environment vectors.
+pub fn spawn_with(path: &str, argv: &[String], env: &[String]) -> Result<u64, SpawnError> {
     let image = vfs::read_all(path).map_err(|_| SpawnError::NotFound)?;
 
     let aspace = vmm::create_address_space().ok_or(SpawnError::NoMemory)?;
     let entry = elf::load(&image, &aspace).map_err(SpawnError::Elf)?;
-    let rsp = build_stack(&aspace, path).ok_or(SpawnError::NoMemory)?;
+    let rsp = build_stack(&aspace, argv, env).ok_or(SpawnError::NoMemory)?;
 
     // From here on the thread owns the address space (and if creating
     // the thread fails, `spawn_user` drops it, freeing everything).
-    let pid = scheduler::spawn_user("user", aspace, entry, rsp).ok_or(SpawnError::NoThread)?;
-    register(pid, path);
+    // Keep the new thread from running until its standard descriptors and
+    // process record are installed. Otherwise a timer preemption could let
+    // it reach user mode and issue a syscall before fd 0/1/2 exist.
+    let irq_state = crate::sync::irq_save();
+    let pid = match scheduler::spawn_user("user", aspace, entry, rsp) {
+        Some(pid) => pid,
+        None => {
+            crate::sync::irq_restore(irq_state);
+            return Err(SpawnError::NoThread);
+        }
+    };
+    crate::syscall::init_process_files(pid);
+    register(pid, scheduler::current_id(), path);
+    crate::sync::irq_restore(irq_state);
     Ok(pid)
 }
 

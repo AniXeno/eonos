@@ -4,7 +4,8 @@
 # Linux-style syscall convention EonOS uses (number in RAX, arguments in
 # RDI/RSI/RDX/R10, result in RAX):
 #
-#     0  read(fd, buf, len)          -- fd 0 only; one line, canonical
+#     0  read(fd, buf, len)          -- fd 0 reads a canonical line;
+#                                       opened files support sequential reads
 #                                       mode, echoed by the kernel, from
 #                                       the PS/2 keyboard and/or COM1.
 #     1  write(fd, buf, len)
@@ -13,19 +14,16 @@
 #    24  sched_yield()
 #    39  getpid()
 #    60  exit(status)
-#  9001  eonos_list_files(buf, len)  -- newline-separated initramfs
-#                                       listing. Stopgap for `ls` until
-#                                       there's a real filesystem/fd
-#                                       table.
-#  9002  eonos_read_file(name, name_len, buf, buf_len)
-#                                     -- whole-file read by path.
-#                                       Stopgap for `cat`.
+#  9001  eonos_list_files(buf, len)  -- newline-separated file listing.
 #  9003  eonos_uptime_ms()           -- milliseconds since boot.
+#  9005  eonos_exec(path, len, argv, envp) -- launch child ELF.
 #  9006  eonos_list_processes(buf, len)
+#  9009  eonos_sync()                 -- flush mounted storage.
+#  9010  eonos_list_block_devices(buf, len) -- lsblk-style block-device table.
 #
-# Commands: ls, cat <file>, exec <file>, write <file> <text>,
+# Commands: ls, cat <file>, exec <file> [args...], write <file> <text>,
 # echo <text>, ps, clear,
-# uptime, pid, help, exit.
+# uptime, sync, pid, help, exit.
 # No pipes, no scripting -- just enough to poke around from a prompt.
 
 .intel_syntax noprefix
@@ -38,6 +36,7 @@ file_buf:   .skip 4096
 FILE_CAP = 4096
 numbuf:     .skip 24                # enough for any 64-bit value in decimal
 wait_status: .skip 4
+exec_argv:   .skip 1024
 edit_path:   .skip 256
 edit_path_len: .skip 8
 edit_size:   .skip 8
@@ -47,7 +46,7 @@ msg_banner:   .ascii "EonOS shell -- type 'help' for commands\n"
 .equ msg_banner_len, . - msg_banner
 prompt:       .ascii "eonsh> "
 .equ prompt_len, . - prompt
-msg_help:     .ascii "commands: ls, cat, exec, write, mkdir, rm, touch, cp, edit, echo, ps, clear, uptime, pid, help, exit\n"
+msg_help:     .ascii "commands: ls, lsblk -f, cat, exec, write, mkdir, rm, touch, cp, edit, echo, ps, clear, uptime, sync, pid, help, exit\n"
 .equ msg_help_len, . - msg_help
 msg_unknown:  .ascii "unknown command: "
 .equ msg_unknown_len, . - msg_unknown
@@ -55,8 +54,16 @@ msg_notfound: .ascii "cat: no such file\n"
 .equ msg_notfound_len, . - msg_notfound
 msg_exec_error: .ascii "exec: unable to launch file\n"
 .equ msg_exec_error_len, . - msg_exec_error
+msg_sync_ok: .ascii "sync: storage reports durable writes\n"
+.equ msg_sync_ok_len, . - msg_sync_ok
+msg_sync_volatile: .ascii "sync: backing storage is volatile; changes remain in RAM\n"
+.equ msg_sync_volatile_len, . - msg_sync_volatile
+msg_sync_error: .ascii "sync: storage commit failed\n"
+.equ msg_sync_error_len, . - msg_sync_error
 msg_ps_error: .ascii "ps: unable to list processes\n"
 .equ msg_ps_error_len, . - msg_ps_error
+msg_lsblk_error: .ascii "lsblk: unable to list block devices\n"
+.equ msg_lsblk_error_len, . - msg_lsblk_error
 msg_write_ok: .ascii "write: saved\n"
 .equ msg_write_ok_len, . - msg_write_ok
 msg_write_error: .ascii "write: failed (use a valid FAT32 path under /disk)\n"
@@ -83,6 +90,8 @@ newline:      .ascii "\n"
 clear_seq:    .ascii "\x1b[2J\x1b[H"    # CSI 2J (clear) + CSI H (home)
 .equ clear_seq_len, . - clear_seq
 cmd_ls:       .ascii "ls"
+cmd_lsblk:    .ascii "lsblk"
+cmd_lsblk_f:  .ascii "lsblk -f"
 cmd_help:     .ascii "help"
 cmd_exit:     .ascii "exit"
 cmd_clear:    .ascii "clear"
@@ -98,6 +107,7 @@ cmd_rm:       .ascii "rm "
 cmd_touch:    .ascii "touch "
 cmd_cp:       .ascii "cp "
 cmd_edit:     .ascii "edit "
+cmd_sync:     .ascii "sync"
 cmd_save:     .ascii ".save"
 cmd_quit:     .ascii ".quit"
 
@@ -127,12 +137,13 @@ _start:
     jne  1f
     dec  rcx
 1:
+    mov  byte ptr [rsi + rcx], 0        # NUL terminate for argv tokenization
     test rcx, rcx
     jz   .Lloop                         # blank line: reprompt
 
     # --- "ls" ------------------------------------------------------
     cmp  rcx, 2
-    jne  .Ltry_help
+    jne  .Ltry_lsblk
     lea  rdi, [rip + cmd_ls]
     mov  r8, rcx
     call streq
@@ -141,9 +152,31 @@ _start:
     call do_ls
     jmp  .Lloop
 
+.Ltry_lsblk:
+    cmp  rcx, 8
+    je   .Ltry_lsblk_f
+    cmp  rcx, 5
+    jne  .Ltry_help
+    lea  rdi, [rip + cmd_lsblk]
+    mov  r8, rcx
+    call streq
+    test rax, rax
+    jz   .Ltry_help
+    call do_lsblk
+    jmp  .Lloop
+
+.Ltry_lsblk_f:
+    lea  rdi, [rip + cmd_lsblk_f]
+    mov  r8, rcx
+    call streq
+    test rax, rax
+    jz   .Ltry_help
+    call do_lsblk
+    jmp  .Lloop
+
 .Ltry_help:
     cmp  rcx, 4
-    jne  .Ltry_exit
+    jne  .Ltry_sync
     lea  rdi, [rip + cmd_help]
     mov  r8, rcx
     call streq
@@ -151,6 +184,33 @@ _start:
     jz   .Ltry_exit
     lea  rsi, [rip + msg_help]
     mov  edx, msg_help_len
+    call print
+    jmp  .Lloop
+
+.Ltry_sync:
+    cmp  rcx, 4
+    jne  .Ltry_exit
+    lea  rdi, [rip + cmd_sync]
+    mov  r8, rcx
+    call streq
+    test rax, rax
+    jz   .Ltry_exit
+    mov  eax, 9009                      # sync / commit request
+    syscall
+    test rax, rax
+    js   1f
+    lea  rsi, [rip + msg_sync_ok]
+    mov  edx, msg_sync_ok_len
+    call print
+    jmp  .Lloop
+1:  cmp  rax, -30                       # EROFS: no persistent backing
+    jne  2f
+    lea  rsi, [rip + msg_sync_volatile]
+    mov  edx, msg_sync_volatile_len
+    call print
+    jmp  .Lloop
+2:  lea  rsi, [rip + msg_sync_error]
+    mov  edx, msg_sync_error_len
     call print
     jmp  .Lloop
 
@@ -189,15 +249,44 @@ _start:
     call strprefix
     test rax, rax
     jz   .Ltry_write
-    lea  rdi, [rip + line_buf + 5]      # path pointer (arg 1)
-    mov  rsi, rcx                       # path length (arg 2)
-    sub  rsi, 5
+    # Split the command tail on spaces in place and build argv.
+    lea  r12, [rip + line_buf + 5]
+    lea  r13, [rip + exec_argv]
+    xor  r14d, r14d
+1:  cmp  byte ptr [r12], 0
+    jne  2f
+    jmp  5f
+2:  cmp  byte ptr [r12], ' '
+    jne  3f
+    inc  r12
+    jmp  1b
+3:  mov  [r13 + r14*8], r12
+    inc  r14
+4:  cmp  byte ptr [r12], 0
+    je   1b
+    cmp  byte ptr [r12], ' '
+    jne  6f
+    mov  byte ptr [r12], 0
+    inc  r12
+    jmp  1b
+6:  inc  r12
+    jmp  4b
+5:  mov  qword ptr [r13 + r14*8], 0
+    mov  rdi, [r13]                     # exec path is argv[0]
+    xor  rsi, rsi
+7:  cmp  byte ptr [rdi + rsi], 0
+    je   8f
+    inc  rsi
+    jmp  7b
+8:  mov  rdx, r13                       # argv
+    xor  r10d, r10d                      # inherit empty environment
     mov  eax, 9005
     syscall
     test rax, rax
     js   .Lexec_error
     mov  rdi, rax
-    lea  rdx, [rip + wait_status]
+    lea  rsi, [rip + wait_status]
+    xor  edx, edx                       # wait options = 0
     mov  eax, 61
     syscall
     jmp  .Lloop
@@ -523,6 +612,31 @@ do_ls:
     call print
 2:  pop  rbx
     ret
+
+# ---------------------------------------------------------------------
+# do_lsblk: display registered block devices and detected filesystem types.
+# ---------------------------------------------------------------------
+do_lsblk:
+    push rbx
+    lea  rdi, [rip + file_buf]
+    mov  esi, FILE_CAP
+    mov  eax, 9010
+    syscall
+    test rax, rax
+    js   1f
+    test rax, rax
+    jz   2f
+    mov  rbx, rax
+    lea  rsi, [rip + file_buf]
+    mov  rdx, rbx
+    call print
+2:  pop  rbx
+    ret
+1:  lea  rsi, [rip + msg_lsblk_error]
+    mov  edx, msg_lsblk_error_len
+    call print
+    pop  rbx
+    ret
 1:  pop  rbx
     ret
 
@@ -561,30 +675,40 @@ do_cat:
     mov  r13, rdx                       # save name len
     mov  rdi, r12
     mov  rsi, r13
-    lea  rdx, [rip + file_buf]
-    mov  r10d, FILE_CAP
-    mov  eax, 9002                      # eonos_read_file
+    xor  edx, edx                       # O_RDONLY
+    mov  eax, 2                         # open
     syscall
-    cmp  rax, 0
-    jge  1f
-    cmp  rax, -34                       # -ERANGE
-    jne  2f
-    lea  rsi, [rip + msg_toobig]
-    mov  edx, msg_toobig_len
-    call print
-    jmp  3f
-2:  lea  rsi, [rip + msg_notfound]
-    mov  edx, msg_notfound_len
-    call print
-    jmp  3f
-1:  mov  rbx, rax
+    test rax, rax
+    js   2f
+    mov  r12, rax                       # open file descriptor
+1:  mov  rdi, r12
+    lea  rsi, [rip + file_buf]
+    mov  edx, FILE_CAP
+    xor  eax, eax                       # read
+    syscall
+    test rax, rax
+    js   3f
+    jz   4f
+    mov  rbx, rax
     lea  rsi, [rip + file_buf]
     mov  rdx, rbx
     call print
-    lea  rsi, [rip + newline]
-    mov  edx, 1
+    jmp  1b
+3:  mov  rdi, r12
+    mov  eax, 3                         # close
+    syscall
+    lea  rsi, [rip + msg_notfound]
+    mov  edx, msg_notfound_len
     call print
-3:  pop  r13
+    jmp  5f
+4:  mov  rdi, r12
+    mov  eax, 3                         # close
+    syscall
+    jmp  5f
+2:  lea  rsi, [rip + msg_notfound]
+    mov  edx, msg_notfound_len
+    call print
+5:  pop  r13
     pop  r12
     pop  rbx
     ret

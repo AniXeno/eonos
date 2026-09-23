@@ -176,3 +176,4 @@ echo "==> Installing BIOS stage 1 into ISO"
 "$LIMINE_DIR/limine" bios-install "$ISO_PATH"
 
 echo "==> Done: $ISO_PATH"
+echo "==> QEMU launch scripts attach a virtual USB keyboard; run ./run.sh or ./runb.sh to test it"
