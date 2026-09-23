@@ -9,20 +9,16 @@
 //! keeps ownership of the controller for PS/2 emulation until the OS
 //! explicitly asks for it) before any of that works at all.
 //!
-//! This module currently does the first step only -- find a USB host
-//! controller on the PCI bus and identify what kind it is -- and stops
-//! there. `init()` is safe to call unconditionally: on hardware with no
-//! USB controller, or one this driver doesn't understand yet, it just
-//! logs what it found (or didn't) and returns. PS/2 remains the only
-//! working keyboard input until `xhci` grows a real driver.
+//! `init()` discovers PCI USB controllers and starts the first xHCI
+//! controller for direct-attached HID boot keyboards. This remains a
+//! small polling driver: it has no hub, hot-plug, or non-xHCI support.
 
 pub mod pci;
 pub mod xhci;
 
 use crate::log_ok;
 
-/// Probe the PCI bus for a USB host controller and report what's
-/// there. Does not touch any device registers yet.
+/// Discover USB host controllers and initialize the first xHCI controller.
 pub fn init() {
     let controllers = pci::find_usb_controllers();
 
@@ -44,7 +40,10 @@ pub fn init() {
         );
     }
 
-    if let Some(xhci_ctrl) = controllers.iter().find(|c| c.kind == pci::ControllerKind::Xhci) {
+    if let Some(xhci_ctrl) = controllers
+        .iter()
+        .find(|c| c.kind == pci::ControllerKind::Xhci)
+    {
         xhci::probe(xhci_ctrl);
     } else {
         log_ok!(

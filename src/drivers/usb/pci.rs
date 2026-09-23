@@ -79,6 +79,10 @@ unsafe fn inl(port: u16) -> u32 {
     val
 }
 
+unsafe fn outw(port: u16, val: u16) {
+    core::arch::asm!("out dx, ax", in("dx") port, in("ax") val, options(nomem, nostack, preserves_flags));
+}
+
 fn config_address(loc: PciLocation, offset: u8) -> u32 {
     (1 << 31)
         | ((loc.bus as u32) << 16)
@@ -94,6 +98,21 @@ fn read_config32(loc: PciLocation, offset: u8) -> u32 {
     }
 }
 
+fn write_config16(loc: PciLocation, offset: u8, value: u16) {
+    unsafe {
+        outl(CONFIG_ADDRESS, config_address(loc, offset));
+        outw(CONFIG_DATA, value);
+    }
+}
+
+/// Enable memory decode and bus mastering before configuring DMA.
+pub fn enable_mmio_bus_master(loc: PciLocation) -> bool {
+    let command = (read_config32(loc, 0x04) as u16) | (1 << 1) | (1 << 2);
+    // Do not echo the adjacent PCI status word: its set bits are W1C.
+    write_config16(loc, 0x04, command);
+    (read_config32(loc, 0x04) as u16 & 0x6) == 0x6
+}
+
 /// Scan every bus/device/function for a USB (class 0x0C, subclass 0x03)
 /// controller. Brute-force: 256 buses x 32 devices x 8 functions is
 /// 65536 config reads worst case, all fast port I/O -- negligible next
@@ -105,7 +124,11 @@ pub fn find_usb_controllers() -> Vec<UsbController> {
         for device in 0u8..32 {
             // Function 0 first: if it reports "no multifunction bit",
             // there's nothing behind functions 1-7 to check.
-            let loc0 = PciLocation { bus: bus as u8, device, function: 0 };
+            let loc0 = PciLocation {
+                bus: bus as u8,
+                device,
+                function: 0,
+            };
             let id = read_config32(loc0, 0x00);
             let vendor_id = (id & 0xFFFF) as u16;
             if vendor_id == 0xFFFF {
@@ -117,7 +140,11 @@ pub fn find_usb_controllers() -> Vec<UsbController> {
             let function_count = if multifunction { 8 } else { 1 };
 
             for function in 0..function_count {
-                let loc = PciLocation { bus: bus as u8, device, function };
+                let loc = PciLocation {
+                    bus: bus as u8,
+                    device,
+                    function,
+                };
                 let id = read_config32(loc, 0x00);
                 if (id & 0xFFFF) as u16 == 0xFFFF {
                     continue;
@@ -151,7 +178,11 @@ pub fn find_usb_controllers() -> Vec<UsbController> {
                     0 // I/O-space BAR; not handled, no xHCI uses this
                 };
 
-                found.push(UsbController { location: loc, kind, mmio_base });
+                found.push(UsbController {
+                    location: loc,
+                    kind,
+                    mmio_base,
+                });
             }
         }
     }

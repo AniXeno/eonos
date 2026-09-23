@@ -16,13 +16,9 @@
 //!   see that file). This is slower to notice a keypress than an
 //!   interrupt would be, bounded by how often the caller polls, but at
 //!   typing speed the difference isn't perceptible.
-//! - **One device, boot protocol only.** This driver finds the first
-//!   port with something HID-keyboard-shaped plugged in, addresses it,
-//!   flips it into the USB HID *boot protocol* (a fixed 8-byte report:
-//!   modifier byte, reserved byte, 6 simultaneous keycodes -- every USB
-//!   keyboard is required to support this even if its normal reports
-//!   are a different shape), and stops there. No hubs, no multiple
-//!   keyboards, no mice, no report-descriptor parsing.
+//! - **Multiple direct-attached boot keyboards.** Each matching device
+//!   is kept in its own xHCI slot and gets its own endpoint ring and
+//!   report buffer. No hubs, mice, or report-descriptor parsing.
 //! - **No hot-plug.** Ports are scanned once, at `init()`. Plugging a
 //!   keyboard in after boot won't be noticed.
 //!
@@ -111,7 +107,8 @@ const PORTSC_CSC: u32 = 1 << 17; // connect status change (write-1-to-clear)
 /// read-modify-writing PORTSC to change something else (like setting
 /// PR), these must be masked out of the value we write back, or we'd
 /// accidentally clear status the controller hasn't told us about yet.
-const PORTSC_RW1C_MASK: u32 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
+const PORTSC_RW1C_MASK: u32 =
+    (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
 
 /// Runtime registers (xHCI 5.5): interrupter 0's registers are what
 /// this driver reads to find and dequeue event TRBs, even though
@@ -146,6 +143,7 @@ struct Trb {
 }
 
 const TRB_CYCLE: u32 = 1 << 0;
+const TRB_CHAIN: u32 = 1 << 4;
 const TRB_TOGGLE_CYCLE: u32 = 1 << 1; // link TRBs only
 const TRB_IOC: u32 = 1 << 5; // interrupt on completion (harmless with INTE off; we poll instead)
 
@@ -162,8 +160,10 @@ const TRB_TYPE_DATA_STAGE: u32 = 3;
 const TRB_TYPE_STATUS_STAGE: u32 = 4;
 const TRB_TYPE_LINK: u32 = 6;
 const TRB_TYPE_ENABLE_SLOT: u32 = 9;
+const TRB_TYPE_DISABLE_SLOT: u32 = 10;
 const TRB_TYPE_ADDRESS_DEVICE: u32 = 11;
 const TRB_TYPE_CONFIGURE_ENDPOINT: u32 = 12;
+const TRB_TYPE_EVALUATE_CONTEXT: u32 = 13;
 const TRB_TYPE_TRANSFER_EVENT: u32 = 32;
 const TRB_TYPE_COMMAND_COMPLETION: u32 = 33;
 
@@ -205,10 +205,19 @@ impl Ring {
             let link = trbs.add(RING_SIZE - 1);
             core::ptr::write_volatile(
                 link,
-                Trb { parameter: phys, status: 0, control: make_type(TRB_TYPE_LINK) | TRB_TOGGLE_CYCLE | TRB_CYCLE },
+                Trb {
+                    parameter: phys,
+                    status: 0,
+                    control: make_type(TRB_TYPE_LINK) | TRB_TOGGLE_CYCLE | TRB_CYCLE,
+                },
             );
         }
-        Some(Ring { trbs, phys, enqueue: 0, cycle: 1 })
+        Some(Ring {
+            trbs,
+            phys,
+            enqueue: 0,
+            cycle: 1,
+        })
     }
 
     /// Write one TRB (cycle bit filled in automatically) and advance,
@@ -239,49 +248,11 @@ impl Ring {
 // Device Context Base Address Array and Input/Device Contexts (xHCI 6.2)
 // ---------------------------------------------------------------------
 
-/// One Slot Context or Endpoint Context: 32 bytes (xHCI 6.2.1 / 6.2.2),
-/// assuming the controller's HCCPARAMS1.CSZ bit is 0 (32-byte
-/// contexts) -- checked at init and aborted otherwise rather than
-/// silently laying out structures the controller would misinterpret.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SlotOrEndpointContext {
-    dwords: [u32; 8],
-}
-const CONTEXT_SIZE: usize = core::mem::size_of::<SlotOrEndpointContext>();
-
-/// Input Control Context plus a Slot Context and endpoint contexts
-/// (xHCI 6.2.5) -- what ADDRESS_DEVICE and CONFIGURE_ENDPOINT commands
-/// point at. Device Context Index (DCI) 1 is always EP0 (the control
-/// endpoint every device has); DCI 2 and up are EP1 OUT, EP1 IN, EP2
-/// OUT, ... in order. This driver only ever populates DCI 1 and DCI 3
-/// (EP1 IN, the interrupt endpoint boot-protocol reports arrive on),
-/// but the layout reserves the full DCI 2-31 range regardless, since
-/// the Slot Context's own "context entries" field -- not how much of
-/// this struct is populated -- is what tells the controller how many
-/// endpoint contexts are actually meaningful.
-#[repr(C)]
-struct InputContext {
-    control: SlotOrEndpointContext,
-    slot: SlotOrEndpointContext,
-    ep0: SlotOrEndpointContext,
-    endpoints: [SlotOrEndpointContext; 30], // DCI 2 (endpoints[0]) through DCI 31 (endpoints[29])
-}
-
-fn slot_context_mut(ctx_phys: u64) -> *mut SlotOrEndpointContext {
-    unsafe { core::ptr::addr_of_mut!((*(pmm::phys_to_virt(ctx_phys) as *mut InputContext)).slot) }
-}
-fn ep_context_mut(ctx_phys: u64, ep_dci: usize) -> *mut SlotOrEndpointContext {
-    // DCI 1 (EP0) has its own dedicated field; DCI N for N >= 2 is
-    // `endpoints[N - 2]`.
-    unsafe {
-        let input = pmm::phys_to_virt(ctx_phys) as *mut InputContext;
-        if ep_dci == 1 {
-            core::ptr::addr_of_mut!((*input).ep0)
-        } else {
-            core::ptr::addr_of_mut!((*input).endpoints[ep_dci - 2])
-        }
-    }
+/// Return one Input Context entry using the controller's selected 32- or
+/// 64-byte context stride. Index 0 is control, 1 is slot, and endpoint
+/// DCI N lives at index N+1.
+fn input_context_entry(ctx_phys: u64, context_size: usize, index: usize) -> *mut u32 {
+    unsafe { pmm::phys_to_virt(ctx_phys).add(index * context_size) as *mut u32 }
 }
 
 // ---------------------------------------------------------------------
@@ -290,7 +261,11 @@ fn ep_context_mut(ctx_phys: u64, ep_dci: usize) -> *mut SlotOrEndpointContext {
 // ---------------------------------------------------------------------
 
 fn setup_packet(request_type: u8, request: u8, value: u16, index: u16, length: u16) -> u64 {
-    (request_type as u64) | ((request as u64) << 8) | ((value as u64) << 16) | ((index as u64) << 32) | ((length as u64) << 48)
+    (request_type as u64)
+        | ((request as u64) << 8)
+        | ((value as u64) << 16)
+        | ((index as u64) << 32)
+        | ((length as u64) << 48)
 }
 
 const REQ_TYPE_STD_DEVICE_IN: u8 = 0x80;
@@ -303,7 +278,88 @@ const HID_REQ_SET_PROTOCOL: u8 = 0x0B;
 const HID_REQ_SET_IDLE: u8 = 0x0A;
 
 const DESC_TYPE_DEVICE: u16 = 1 << 8;
+const DESC_TYPE_CONFIGURATION: u16 = 2 << 8;
 const HID_PROTOCOL_BOOT: u16 = 0;
+
+#[derive(Clone, Copy)]
+struct BootKeyboardEndpoint {
+    configuration: u8,
+    interface: u8,
+    dci: u8,
+    max_packet: u16,
+    interval: u8,
+}
+
+fn find_boot_keyboard(config: &[u8]) -> Option<BootKeyboardEndpoint> {
+    if config.len() < 9 || config[1] != 2 {
+        return None;
+    }
+    let total = u16::from_le_bytes([config[2], config[3]]) as usize;
+    if total < 9 || total > config.len() {
+        return None;
+    }
+    let configuration = config[5];
+    let mut keyboard_iface = None;
+    let mut offset = 9usize;
+    while offset + 2 <= total {
+        let len = config[offset] as usize;
+        let kind = config[offset + 1];
+        if len < 2 || offset + len > total {
+            return None;
+        }
+        match kind {
+            4 if len >= 9 => {
+                // HID class, boot subclass, keyboard protocol, alternate 0.
+                keyboard_iface = if config[offset + 3] == 0
+                    && config[offset + 5] == 3
+                    && config[offset + 6] == 1
+                    && config[offset + 7] == 1
+                {
+                    Some(config[offset + 2])
+                } else {
+                    None
+                };
+            }
+            5 if len >= 7 && keyboard_iface.is_some() => {
+                let address = config[offset + 2];
+                let attributes = config[offset + 3];
+                let packet = u16::from_le_bytes([config[offset + 4], config[offset + 5]]) & 0x07ff;
+                if address & 0x80 != 0
+                    && address & 0x0f != 0
+                    && attributes & 0x03 == 0x03
+                    && packet >= 8
+                {
+                    let endpoint = address & 0x0f;
+                    return Some(BootKeyboardEndpoint {
+                        configuration,
+                        interface: keyboard_iface.unwrap(),
+                        dci: endpoint * 2 + 1,
+                        max_packet: packet,
+                        interval: config[offset + 6].max(1),
+                    });
+                }
+            }
+            _ => {}
+        }
+        offset += len;
+    }
+    None
+}
+
+fn xhci_interval(speed: u32, descriptor_interval: u8) -> Option<u32> {
+    let interval = descriptor_interval.max(1) as u32;
+    match speed {
+        // Full/low-speed bInterval is in 1 ms frames. xHCI encodes
+        // service intervals as powers of two microframes (125 us).
+        1 | 2 => {
+            let microframes = interval.checked_mul(8)?;
+            Some((32 - (microframes - 1).leading_zeros()) + 1)
+        }
+        // High/SuperSpeed bInterval already uses the exponent encoding.
+        3 | 4 if interval <= 16 => Some(interval),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------
 // The controller itself.
@@ -315,6 +371,7 @@ struct Controller {
     rt: *mut RuntimeRegs,
     db: *mut u32, // doorbell array, one u32 per slot (0 = command ring doorbell)
     max_ports: u8,
+    context_size: usize,
 
     cmd_ring: Ring,
     event_ring: Ring,
@@ -325,24 +382,24 @@ struct Controller {
     event_dequeue: usize,
 
     dcbaa_phys: u64,
-    /// Physical address of the one device's Input Context, and the
-    /// separate Device Context the controller writes live state back
-    /// into (they must be different pages -- xHCI 4.2 -- with the
-    /// DCBAA slot entry pointing at the *output* Device Context, never
-    /// the Input Context used only for commands).
+    /// Reused Input Context for serial device setup commands.
     input_ctx_phys: u64,
+    /// Scratch output context and EP0 ring for the device currently
+    /// being enumerated. Successful devices retain their own pages.
     output_ctx_phys: u64,
     ep0_ring_phys: u64,
 
     slot_id: u8,
-    /// Interrupt-IN endpoint's transfer ring, once a keyboard is
-    /// configured. `None` until a keyboard is actually found and set
-    /// up in `try_setup_keyboard`.
-    keyboard_ring: Option<Ring>,
-    /// One 8-byte boot-protocol report buffer, reused for every polled
-    /// transfer -- the controller DMAs into this on each successful
-    /// interrupt-IN completion.
+    keyboards: alloc::vec::Vec<UsbKeyboard>,
+}
+
+struct UsbKeyboard {
+    port: u8,
+    slot_id: u8,
+    dci: u8,
+    ring: Ring,
     report_phys: u64,
+    prev_keys: [u8; 6],
 }
 
 // Not Sync/Send by default (raw pointers); access is always through the
@@ -351,7 +408,6 @@ struct Controller {
 unsafe impl Send for Controller {}
 
 static CONTROLLER: IrqMutex<Option<Controller>> = IrqMutex::new(None);
-static KEYBOARD_READY: AtomicBool = AtomicBool::new(false);
 /// Tracks Caps Lock across polls the same way `drivers::ps2` does, so
 /// USB and PS/2 keyboards produce identically-cased ASCII into whatever
 /// reads `try_read_byte`.
@@ -362,7 +418,6 @@ static CAPS_LOCK: AtomicBool = AtomicBool::new(false);
 /// queue with one character per poll instead of one per press -- USB
 /// boot reports give no separate press/release events the way PS/2
 /// scancodes do; a release is just "this keycode is no longer listed".
-static PREV_KEYS: IrqMutex<[u8; 6]> = IrqMutex::new([0; 6]);
 
 fn reg_read32(ptr: *const u32) -> u32 {
     unsafe { core::ptr::read_volatile(ptr) }
@@ -375,26 +430,26 @@ fn reg_write64_split(lo: *mut u32, hi: *mut u32, val: u64) {
     reg_write32(hi, (val >> 32) as u32);
 }
 
-/// Spin up to roughly `iters` times waiting for `cond` to become true,
-/// yielding to other threads between checks so a slow or absent
-/// controller can't hang the whole kernel. Every hardware wait in this
-/// driver goes through this, mirroring `ps2.rs`'s bounded spins --
-/// nothing here trusts a device to respond in any particular time.
-fn spin_until(iters: u32, mut cond: impl FnMut() -> bool) -> bool {
-    for _ in 0..iters {
+/// Wait with a wall-clock timeout. PIT is initialized before USB
+/// probing, so waits do not depend on CPU speed or emulator timing.
+fn spin_until(timeout_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = crate::pit::uptime_ms().saturating_add(timeout_ms);
+    loop {
         if cond() {
             return true;
         }
+        if crate::pit::uptime_ms() >= deadline {
+            return false;
+        }
         crate::scheduler::yield_now();
     }
-    false
 }
 
 /// Entry point from `usb::init()`. Brings the controller up far enough
-/// to enumerate one keyboard, if one is plugged in. Every failure path
-/// logs and returns rather than panicking -- absent, non-compliant, or
-/// already-owned-by-firmware hardware is expected on some machines and
-/// must not take down boot.
+/// to enumerate every directly connected boot keyboard it can configure.
+/// Every failure path logs and returns rather than panicking -- absent,
+/// non-compliant, or already-owned-by-firmware hardware is expected on
+/// some machines and must not take down boot.
 /// Extended Capability ID 1: USB Legacy Support (xHCI 7.1.1). Byte
 /// layout of its first dword: capability ID (bits 0:7), next-capability
 /// pointer in dwords (bits 8:15, 0 = end of list), BIOS-owned semaphore
@@ -434,12 +489,16 @@ fn request_bios_handoff(base: *mut u8, xecp_offset_dwords: usize) {
 
         if cap_id == XECP_ID_USB_LEGACY {
             if cap_dword & USBLEGSUP_BIOS_OWNED == 0 {
-                log_ok!("USB", "xHCI", "Controller already OS-owned, no handoff needed");
+                log_ok!(
+                    "USB",
+                    "xHCI",
+                    "Controller already OS-owned, no handoff needed"
+                );
                 return;
             }
             log_ok!("USB", "xHCI", "Requesting BIOS-to-OS handoff");
             reg_write32(cap_ptr, cap_dword | USBLEGSUP_OS_OWNED);
-            let handed_over = spin_until(500_000, || reg_read32(cap_ptr) & USBLEGSUP_BIOS_OWNED == 0);
+            let handed_over = spin_until(5_000, || reg_read32(cap_ptr) & USBLEGSUP_BIOS_OWNED == 0);
             if !handed_over {
                 // Some firmware never clears this bit despite otherwise
                 // behaving correctly; log it and proceed anyway rather
@@ -467,7 +526,20 @@ fn request_bios_handoff(base: *mut u8, xecp_offset_dwords: usize) {
 
 pub fn probe(controller: &UsbController) {
     if controller.mmio_base == 0 {
-        log_fail!("USB", "xHCI", "Controller has no usable memory BAR -- cannot probe");
+        log_fail!(
+            "USB",
+            "xHCI",
+            "Controller has no usable memory BAR -- cannot probe"
+        );
+        return;
+    }
+
+    if !super::pci::enable_mmio_bus_master(controller.location) {
+        log_fail!(
+            "USB",
+            "xHCI",
+            "Could not enable PCI memory decoding and bus mastering"
+        );
         return;
     }
 
@@ -501,12 +573,8 @@ pub fn probe(controller: &UsbController) {
         if context_size_64 { 64 } else { 32 }
     );
 
-    if context_size_64 {
-        // A fuller driver would just use 64-byte contexts; this one
-        // assumes 32-byte throughout (see `SlotOrEndpointContext`), so
-        // bail rather than lay out structures the controller will
-        // misinterpret.
-        log_fail!("USB", "xHCI", "Controller wants 64-byte contexts, which this driver doesn't support yet");
+    if max_slots == 0 || max_ports == 0 {
+        log_fail!("USB", "xHCI", "Controller reports no usable slots or ports");
         return;
     }
 
@@ -520,7 +588,11 @@ pub fn probe(controller: &UsbController) {
     }
 
     if !reset_controller(op) {
-        log_fail!("USB", "xHCI", "Controller did not come out of reset in time");
+        log_fail!(
+            "USB",
+            "xHCI",
+            "Controller did not come out of reset in time"
+        );
         return;
     }
 
@@ -545,11 +617,19 @@ pub fn probe(controller: &UsbController) {
         return;
     };
     let Some(erst_phys) = pmm::alloc_frame_zeroed() else {
-        log_fail!("USB", "xHCI", "Out of memory allocating the event ring segment table");
+        log_fail!(
+            "USB",
+            "xHCI",
+            "Out of memory allocating the event ring segment table"
+        );
         return;
     };
     let Some(ep0_ring) = Ring::new() else {
-        log_fail!("USB", "xHCI", "Out of memory allocating EP0's transfer ring");
+        log_fail!(
+            "USB",
+            "xHCI",
+            "Out of memory allocating EP0's transfer ring"
+        );
         return;
     };
 
@@ -566,8 +646,16 @@ pub fn probe(controller: &UsbController) {
     // Program DCBAAP, CRCR, and the interrupter's event ring pointers.
     // CRCR's cycle bit (bit 0) must be OR'd into the address to match
     // the ring's initial producer cycle state.
-    reg_write64_split(unsafe { core::ptr::addr_of_mut!((*op).dcbaap_lo) }, unsafe { core::ptr::addr_of_mut!((*op).dcbaap_hi) }, dcbaa_phys);
-    reg_write64_split(unsafe { core::ptr::addr_of_mut!((*op).crcr_lo) }, unsafe { core::ptr::addr_of_mut!((*op).crcr_hi) }, cmd_ring.phys | 1);
+    reg_write64_split(
+        unsafe { core::ptr::addr_of_mut!((*op).dcbaap_lo) },
+        unsafe { core::ptr::addr_of_mut!((*op).dcbaap_hi) },
+        dcbaa_phys,
+    );
+    reg_write64_split(
+        unsafe { core::ptr::addr_of_mut!((*op).crcr_lo) },
+        unsafe { core::ptr::addr_of_mut!((*op).crcr_hi) },
+        cmd_ring.phys | 1,
+    );
     reg_write32(unsafe { core::ptr::addr_of_mut!((*rt).ir0_erstsz) }, 1);
     reg_write64_split(
         unsafe { core::ptr::addr_of_mut!((*rt).ir0_erstba_lo) },
@@ -579,15 +667,21 @@ pub fn probe(controller: &UsbController) {
         unsafe { core::ptr::addr_of_mut!((*rt).ir0_erdp_hi) },
         event_ring.phys,
     );
-    // CONFIG: tell the controller how many device slots we intend to
-    // use. One is plenty for a single keyboard.
-    reg_write32(unsafe { core::ptr::addr_of_mut!((*op).config) }, 1.min(max_slots as u32));
+    // Allow one xHCI slot per reported controller capability. The
+    // DCBAA page has enough entries for the architectural maximum.
+    reg_write32(unsafe { core::ptr::addr_of_mut!((*op).config) }, max_slots as u32);
 
     // Run the controller. Interrupts (USBCMD bit 2) deliberately left
     // off -- see module docs.
     reg_write32(unsafe { core::ptr::addr_of_mut!((*op).usbcmd) }, USBCMD_RUN);
-    if !spin_until(100_000, || reg_read32(unsafe { core::ptr::addr_of!((*op).usbsts) }) & USBSTS_HCH == 0) {
-        log_fail!("USB", "xHCI", "Controller did not leave Halted state after Run");
+    if !spin_until(1_000, || {
+        reg_read32(unsafe { core::ptr::addr_of!((*op).usbsts) }) & USBSTS_HCH == 0
+    }) {
+        log_fail!(
+            "USB",
+            "xHCI",
+            "Controller did not leave Halted state after Run"
+        );
         return;
     }
 
@@ -597,6 +691,7 @@ pub fn probe(controller: &UsbController) {
         rt,
         db,
         max_ports,
+        context_size: if context_size_64 { 64 } else { 32 },
         cmd_ring,
         event_ring,
         event_cycle: 1,
@@ -606,8 +701,7 @@ pub fn probe(controller: &UsbController) {
         output_ctx_phys,
         ep0_ring_phys: ep0_ring.phys,
         slot_id: 0,
-        keyboard_ring: None,
-        report_phys: 0,
+        keyboards: alloc::vec::Vec::new(),
     };
     // `ep0_ring` itself goes out of scope here, which is fine: `Ring`
     // has no `Drop` impl (its backing page is intentionally never freed
@@ -617,18 +711,55 @@ pub fn probe(controller: &UsbController) {
     // in `EP0_RING_STATE`, reconstructed into a fresh `Ring` value on
     // each call (see `control_transfer`) rather than kept live here.
 
-    log_ok!("USB", "xHCI", "Controller running, scanning {} port(s) for a keyboard", max_ports);
+    log_ok!(
+        "USB",
+        "xHCI",
+        "Controller running, scanning {} port(s) for a keyboard",
+        max_ports
+    );
 
     for port in 1..=max_ports {
         if try_setup_keyboard(&mut controller, port) {
             log_ok!("USB", "xHCI", "USB keyboard ready on port {}", port);
-            KEYBOARD_READY.store(true, Ordering::Release);
-            *CONTROLLER.lock() = Some(controller);
-            return;
+            // Keep this slot alive and use a fresh slot for the next
+            // connected port. Setup data pages belong to this device.
+            controller.slot_id = 0;
+            *EP0_RING_STATE.lock() = (0, 1);
+        }
+        if controller.slot_id != 0 {
+            let failed_slot = controller.slot_id;
+            let _ = do_command(
+                &mut controller,
+                Trb {
+                    parameter: 0,
+                    status: 0,
+                    control: make_type(TRB_TYPE_DISABLE_SLOT) | ((failed_slot as u32) << 24),
+                },
+            );
+            unsafe {
+                let dcbaa = pmm::phys_to_virt(controller.dcbaa_phys) as *mut u64;
+                core::ptr::write_volatile(dcbaa.add(failed_slot as usize), 0);
+                core::ptr::write_bytes(
+                    pmm::phys_to_virt(controller.input_ctx_phys),
+                    0,
+                    pmm::PAGE_SIZE as usize,
+                );
+                core::ptr::write_bytes(
+                    pmm::phys_to_virt(controller.output_ctx_phys),
+                    0,
+                    pmm::PAGE_SIZE as usize,
+                );
+            }
+            controller.slot_id = 0;
+            *EP0_RING_STATE.lock() = (0, 1);
         }
     }
 
-    log_ok!("USB", "xHCI", "No USB keyboard found on any port");
+    if controller.keyboards.is_empty() {
+        log_ok!("USB", "xHCI", "No USB keyboard found on any port");
+    } else {
+        log_ok!("USB", "xHCI", "Configured {} USB keyboard(s)", controller.keyboards.len());
+    }
     *CONTROLLER.lock() = Some(controller);
 }
 
@@ -637,15 +768,24 @@ fn reset_controller(op: *mut OpRegs) -> bool {
     // have left it in a running state), then reset.
     if reg_read32(unsafe { core::ptr::addr_of!((*op).usbcmd) }) & USBCMD_RUN != 0 {
         reg_write32(unsafe { core::ptr::addr_of_mut!((*op).usbcmd) }, 0);
-        if !spin_until(100_000, || reg_read32(unsafe { core::ptr::addr_of!((*op).usbsts) }) & USBSTS_HCH != 0) {
+        if !spin_until(1_000, || {
+            reg_read32(unsafe { core::ptr::addr_of!((*op).usbsts) }) & USBSTS_HCH != 0
+        }) {
             return false;
         }
     }
-    reg_write32(unsafe { core::ptr::addr_of_mut!((*op).usbcmd) }, USBCMD_HCRST);
-    if !spin_until(100_000, || reg_read32(unsafe { core::ptr::addr_of!((*op).usbcmd) }) & USBCMD_HCRST == 0) {
+    reg_write32(
+        unsafe { core::ptr::addr_of_mut!((*op).usbcmd) },
+        USBCMD_HCRST,
+    );
+    if !spin_until(1_000, || {
+        reg_read32(unsafe { core::ptr::addr_of!((*op).usbcmd) }) & USBCMD_HCRST == 0
+    }) {
         return false;
     }
-    spin_until(100_000, || reg_read32(unsafe { core::ptr::addr_of!((*op).usbsts) }) & USBSTS_CNR == 0)
+    spin_until(1_000, || {
+        reg_read32(unsafe { core::ptr::addr_of!((*op).usbsts) }) & USBSTS_CNR == 0
+    })
 }
 
 fn port_regs(c: &Controller, port: u8) -> *mut PortRegs {
@@ -664,7 +804,7 @@ fn do_command(c: &mut Controller, trb: Trb) -> Option<(u32, u8)> {
     reg_write32(c.db, 0); // doorbell 0, target 0 = command ring doorbell
 
     let mut result = None;
-    let ok = spin_until(500_000, || {
+    let ok = spin_until(1_000, || {
         if let Some(ev) = poll_event_ring(c) {
             if trb_type(ev.control) == TRB_TYPE_COMMAND_COMPLETION && ev.parameter == slot_phys {
                 let completion_code = (ev.status >> 24) & 0xFF;
@@ -672,10 +812,9 @@ fn do_command(c: &mut Controller, trb: Trb) -> Option<(u32, u8)> {
                 result = Some((completion_code, slot_id));
                 return true;
             }
-            // A different event (e.g. a port status change queued up in
-            // between) -- not what this call is waiting for, but
-            // `poll_event_ring` already advanced past it, so the ring
-            // doesn't back up; just keep spinning for the one we want.
+            // Keep already-configured keyboards serviced while setup
+            // commands for later ports are waiting on the shared ring.
+            dispatch_keyboard_event(c, ev);
         }
         false
     });
@@ -728,12 +867,30 @@ fn try_setup_keyboard(c: &mut Controller, port: u8) -> bool {
         return false; // nothing plugged in
     }
 
+    // Every enabled xHCI slot needs a distinct Output Device Context and
+    // EP0 transfer ring. Keep these pages for the device's lifetime.
+    let Some(output_ctx_phys) = pmm::alloc_frame_zeroed() else {
+        log_fail!("USB", "xHCI", "Out of memory allocating port {} device context", port);
+        return false;
+    };
+    let Some(ep0_ring) = Ring::new() else {
+        log_fail!("USB", "xHCI", "Out of memory allocating port {} EP0 ring", port);
+        return false;
+    };
+    c.output_ctx_phys = output_ctx_phys;
+    c.ep0_ring_phys = ep0_ring.phys;
+
     // Reset the port (required before it's usable regardless of
     // whether it was already enabled by firmware) and wait for the
     // reset-complete status bit.
     let cleared = portsc & !PORTSC_RW1C_MASK;
-    reg_write32(unsafe { core::ptr::addr_of_mut!((*regs).portsc) }, cleared | PORTSC_PR);
-    if !spin_until(200_000, || reg_read32(unsafe { core::ptr::addr_of!((*regs).portsc) }) & PORTSC_PRC != 0) {
+    reg_write32(
+        unsafe { core::ptr::addr_of_mut!((*regs).portsc) },
+        cleared | PORTSC_PR,
+    );
+    if !spin_until(1_000, || {
+        reg_read32(unsafe { core::ptr::addr_of!((*regs).portsc) }) & PORTSC_PRC != 0
+    }) {
         return false;
     }
     // Clear the reset-change bit we just observed (write-1-to-clear).
@@ -749,7 +906,14 @@ fn try_setup_keyboard(c: &mut Controller, port: u8) -> bool {
     let speed = (after_reset & PORTSC_SPEED_MASK) >> 10;
 
     // Enable Slot.
-    let Some((code, slot_id)) = do_command(c, Trb { parameter: 0, status: 0, control: make_type(TRB_TYPE_ENABLE_SLOT) }) else {
+    let Some((code, slot_id)) = do_command(
+        c,
+        Trb {
+            parameter: 0,
+            status: 0,
+            control: make_type(TRB_TYPE_ENABLE_SLOT),
+        },
+    ) else {
         return false;
     };
     if code != COMPLETION_SUCCESS || slot_id == 0 {
@@ -757,31 +921,49 @@ fn try_setup_keyboard(c: &mut Controller, port: u8) -> bool {
     }
     c.slot_id = slot_id;
 
+    unsafe {
+        core::ptr::write_bytes(
+            pmm::phys_to_virt(c.input_ctx_phys),
+            0,
+            pmm::PAGE_SIZE as usize,
+        );
+        core::ptr::write_bytes(
+            pmm::phys_to_virt(c.output_ctx_phys),
+            0,
+            pmm::PAGE_SIZE as usize,
+        );
+    }
+
     // Fill in the Input Context: Input Control Context says "apply slot
     // context + endpoint 0 context" (add-context bits A0 and A1), the
     // Slot Context describes the device's route/speed/port, and the
     // EP0 (control endpoint) context sets up its transfer ring.
     unsafe {
-        let control_ctx = pmm::phys_to_virt(c.input_ctx_phys) as *mut SlotOrEndpointContext;
-        (*control_ctx).dwords[1] = 0b11; // A0 (slot) | A1 (EP0)
+        let control_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 0);
+        *control_ctx.add(1) = 0b11; // A0 (slot) | A1 (EP0)
 
-        let slot_ctx = slot_context_mut(c.input_ctx_phys);
+        let slot_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 1);
         // dword0: route string (0, direct on root hub) | speed (bits
         // 20:23) | context entries (bits 27:31, at least 1 for EP0).
-        (*slot_ctx).dwords[0] = (speed << 20) | (1 << 27);
+        *slot_ctx = (speed << 20) | (1 << 27);
         // dword1 bits 16:23: root hub port number.
-        (*slot_ctx).dwords[1] = (port as u32) << 16;
+        *slot_ctx.add(1) = (port as u32) << 16;
 
-        let ep0_ctx = ep_context_mut(c.input_ctx_phys, 1);
+        let ep0_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 2);
         // EP type = 4 (control) in dword1 bits 3:5; max packet size
         // depends on speed (8 for low speed, 64 otherwise is a
         // reasonable default for full/high speed -- a fuller driver
         // reads this from the device descriptor's bMaxPacketSize0 and
         // reconfigures, which this one skips for simplicity).
-        let max_packet0: u32 = if speed == 2 { 8 } else { 64 }; // speed 2 = low-speed
-        (*ep0_ctx).dwords[1] = (4 << 3) | (max_packet0 << 16) | (3 << 1); // CErr=3
-        (*ep0_ctx).dwords[2] = (c.ep0_ring_phys | 1) as u32; // TR dequeue ptr lo | DCS=1
-        (*ep0_ctx).dwords[3] = (c.ep0_ring_phys >> 32) as u32;
+        let max_packet0: u32 = match speed {
+            1 | 2 => 8, // full- and low-speed control endpoints
+            3 => 64,    // high-speed
+            4 => 512,   // SuperSpeed
+            _ => return false,
+        };
+        *ep0_ctx.add(1) = (4 << 3) | (max_packet0 << 16) | (3 << 1); // CErr=3
+        *ep0_ctx.add(2) = (c.ep0_ring_phys | 1) as u32; // TR dequeue ptr lo | DCS=1
+        *ep0_ctx.add(3) = (c.ep0_ring_phys >> 32) as u32;
     }
 
     // Point the DCBAA's slot entry at the Output Device Context so the
@@ -805,39 +987,130 @@ fn try_setup_keyboard(c: &mut Controller, port: u8) -> bool {
         return false;
     }
 
-    // Device now has a USB address and EP0 is usable. Ask for the
-    // device descriptor -- mostly just to confirm it's really there and
-    // responsive. A fuller driver would check idVendor/idProduct or
-    // walk the interface descriptors to confirm HID class 3 / boot
-    // subclass 1 / protocol 1 (keyboard) before assuming boot-keyboard
-    // reports mean anything; this one assumes "answered EP0 on this
-    // port" is enough, which is a real simplification -- a USB mouse or
-    // other class-3 boot device on this port would be treated the same
-    // way and produce garbage keycodes.
-    let Some(desc_phys) = pmm::alloc_frame_zeroed() else { return false };
+    // USB 2 full-speed devices report their EP0 packet size in the device
+    // descriptor. The address command must start with 8 bytes; after the
+    // first eight descriptor bytes, update EP0 before any larger request.
+    if speed == 1 {
+        let Some(device_desc_phys) = pmm::alloc_frame_zeroed() else {
+            return false;
+        };
+        if !control_transfer_in(
+            c,
+            setup_packet(
+                REQ_TYPE_STD_DEVICE_IN,
+                REQ_GET_DESCRIPTOR,
+                DESC_TYPE_DEVICE,
+                0,
+                8,
+            ),
+            device_desc_phys,
+            8,
+        ) {
+            return false;
+        }
+        let packet_size =
+            unsafe { core::ptr::read_volatile(pmm::phys_to_virt(device_desc_phys).add(7)) };
+        if !matches!(packet_size, 8 | 16 | 32 | 64) {
+            return false;
+        }
+        unsafe {
+            let control_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 0);
+            core::ptr::write_bytes(control_ctx, 0, c.context_size / 4);
+            *control_ctx.add(1) = 1 << 1; // update EP0 context only
+            let ep0_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 2);
+            *ep0_ctx.add(1) = (4 << 3) | ((packet_size as u32) << 16) | (3 << 1);
+            *ep0_ctx.add(2) = (c.ep0_ring_phys | 1) as u32;
+            *ep0_ctx.add(3) = (c.ep0_ring_phys >> 32) as u32;
+        }
+        let Some((code, _)) = do_command(
+            c,
+            Trb {
+                parameter: c.input_ctx_phys,
+                status: 0,
+                control: make_type(TRB_TYPE_EVALUATE_CONTEXT) | ((c.slot_id as u32) << 24),
+            },
+        ) else {
+            return false;
+        };
+        if code != COMPLETION_SUCCESS {
+            return false;
+        }
+    }
+
+    // Read and parse the active configuration so composite keyboards and
+    // devices whose keyboard endpoint is not EP1 are handled correctly.
+    let Some(desc_phys) = pmm::alloc_frame_zeroed() else {
+        return false;
+    };
     if !control_transfer_in(
         c,
-        setup_packet(REQ_TYPE_STD_DEVICE_IN, REQ_GET_DESCRIPTOR, DESC_TYPE_DEVICE, 0, 18),
+        setup_packet(
+            REQ_TYPE_STD_DEVICE_IN,
+            REQ_GET_DESCRIPTOR,
+            DESC_TYPE_CONFIGURATION,
+            0,
+            9,
+        ),
         desc_phys,
-        18,
+        9,
     ) {
         return false;
     }
 
-    // SET_CONFIGURATION 1 -- assumes configuration value 1 exists and is
-    // the one we want, true for essentially every simple USB HID
-    // keyboard (a fuller driver would parse the configuration
-    // descriptor and use its actual bConfigurationValue).
-    if !control_transfer_out(c, setup_packet(REQ_TYPE_STD_DEVICE_OUT, REQ_SET_CONFIGURATION, 1, 0, 0)) {
+    let desc = pmm::phys_to_virt(desc_phys);
+    let total_length = unsafe { core::ptr::read_volatile(desc.add(2)) as usize }
+        | ((unsafe { core::ptr::read_volatile(desc.add(3)) as usize }) << 8);
+    if !(9..=pmm::PAGE_SIZE as usize).contains(&total_length) {
+        return false;
+    }
+    if !control_transfer_in(
+        c,
+        setup_packet(
+            REQ_TYPE_STD_DEVICE_IN,
+            REQ_GET_DESCRIPTOR,
+            DESC_TYPE_CONFIGURATION,
+            0,
+            total_length as u16,
+        ),
+        desc_phys,
+        total_length as u32,
+    ) {
+        return false;
+    }
+    let config = unsafe { core::slice::from_raw_parts(desc, total_length) };
+    let Some(keyboard) = find_boot_keyboard(config) else {
+        return false;
+    };
+    let Some(interval) = xhci_interval(speed, keyboard.interval) else {
+        return false;
+    };
+
+    // Select the configuration containing the boot keyboard interface.
+    if !control_transfer_out(
+        c,
+        setup_packet(
+            REQ_TYPE_STD_DEVICE_OUT,
+            REQ_SET_CONFIGURATION,
+            keyboard.configuration as u16,
+            0,
+            0,
+        ),
+    ) {
         return false;
     }
 
     // HID SET_PROTOCOL(Boot) -- guarantees the fixed 8-byte report
-    // layout this driver decodes. Interface 0 is assumed to be the
-    // keyboard interface, true for the vast majority of plain USB
-    // keyboards (a composite device with, say, a media-key interface
-    // alongside would need real interface-descriptor parsing).
-    if !control_transfer_out(c, setup_packet(REQ_TYPE_CLASS_IFACE_OUT, HID_REQ_SET_PROTOCOL, HID_PROTOCOL_BOOT, 0, 0)) {
+    // layout this driver decodes.
+    if !control_transfer_out(
+        c,
+        setup_packet(
+            REQ_TYPE_CLASS_IFACE_OUT,
+            HID_REQ_SET_PROTOCOL,
+            HID_PROTOCOL_BOOT,
+            keyboard.interface as u16,
+            0,
+        ),
+    ) {
         return false;
     }
     // SET_IDLE 0: ask the device to only send a report when something
@@ -845,33 +1118,37 @@ fn try_setup_keyboard(c: &mut Controller, port: u8) -> bool {
     // -- some devices are picky about it, and a keyboard that just
     // repeats its last report on a timer still works fine with this
     // driver's press/release diffing.
-    let _ = control_transfer_out(c, setup_packet(REQ_TYPE_CLASS_IFACE_OUT, HID_REQ_SET_IDLE, 0, 0, 0));
+    let _ = control_transfer_out(
+        c,
+        setup_packet(
+            REQ_TYPE_CLASS_IFACE_OUT,
+            HID_REQ_SET_IDLE,
+            0,
+            keyboard.interface as u16,
+            0,
+        ),
+    );
 
-    // Now configure the interrupt-IN endpoint (EP1 IN, DCI 3 by USB
-    // convention -- IN endpoints are odd DCIs starting from 3) that
-    // boot-protocol reports arrive on. This driver assumes endpoint
-    // number 1 IN, true for the large majority of simple keyboards but
-    // not guaranteed by spec; a fuller driver would read this out of
-    // the HID interface's endpoint descriptor instead.
-    let Some(kb_ring) = Ring::new() else { return false };
+    // Configure the interrupt-IN endpoint found in the interface descriptor.
+    let Some(kb_ring) = Ring::new() else {
+        return false;
+    };
     unsafe {
-        let control_ctx = pmm::phys_to_virt(c.input_ctx_phys) as *mut SlotOrEndpointContext;
-        core::ptr::write_bytes(control_ctx, 0, 1); // fresh Input Control Context for this command
-        (*control_ctx).dwords[1] = 1 << 3; // A3: add endpoint context at DCI 3 (EP1 IN)
-        let slot_ctx = slot_context_mut(c.input_ctx_phys);
-        (*slot_ctx).dwords[0] = (speed << 20) | (3 << 27); // context entries now includes DCI 3
+        let control_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 0);
+        core::ptr::write_bytes(control_ctx, 0, c.context_size / 4);
+        *control_ctx.add(1) = 1 << keyboard.dci;
+        let slot_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 1);
+        *slot_ctx = (speed << 20) | ((keyboard.dci as u32) << 27);
 
-        let ep1in_ctx = ep_context_mut(c.input_ctx_phys, 3);
+        let ep1in_ctx =
+            input_context_entry(c.input_ctx_phys, c.context_size, keyboard.dci as usize + 1);
         const EP_TYPE_INTERRUPT_IN: u32 = 7;
-        let max_packet: u32 = 8; // boot-protocol reports are always 8 bytes
-        (*ep1in_ctx).dwords[1] = (EP_TYPE_INTERRUPT_IN << 3) | (max_packet << 16) | (3 << 1);
-        // Interval field (dword0 bits 16:23) as an exponent of 2 * 125us
-        // frames; 4 (~1ms at full/high speed, near enough at low speed
-        // too) is a safe, responsive-enough default without reading the
-        // endpoint descriptor's actual bInterval.
-        (*ep1in_ctx).dwords[0] = 4 << 16;
-        (*ep1in_ctx).dwords[2] = (kb_ring.phys | 1) as u32;
-        (*ep1in_ctx).dwords[3] = (kb_ring.phys >> 32) as u32;
+        *ep1in_ctx.add(1) =
+            (EP_TYPE_INTERRUPT_IN << 3) | ((keyboard.max_packet as u32) << 16) | (3 << 1);
+        *ep1in_ctx = interval << 16;
+        *ep1in_ctx.add(2) = (kb_ring.phys | 1) as u32;
+        *ep1in_ctx.add(3) = (kb_ring.phys >> 32) as u32;
+        *ep1in_ctx.add(4) = 8; // average TRB length
     }
 
     let Some((code, _)) = do_command(
@@ -888,13 +1165,19 @@ fn try_setup_keyboard(c: &mut Controller, port: u8) -> bool {
         return false;
     }
 
-    let Some(report_phys) = pmm::alloc_frame_zeroed() else { return false };
-    c.keyboard_ring = Some(kb_ring);
-    c.report_phys = report_phys;
-
-    // Prime the first transfer so `poll()` has something outstanding to
-    // check on the very first call.
-    submit_report_read(c);
+    let Some(report_phys) = pmm::alloc_frame_zeroed() else {
+        return false;
+    };
+    c.keyboards.push(UsbKeyboard {
+        port,
+        slot_id: c.slot_id,
+        dci: keyboard.dci,
+        ring: kb_ring,
+        report_phys,
+        prev_keys: [0; 6],
+    });
+    let device = c.keyboards.last_mut().unwrap();
+    submit_report_read(c.db, device);
 
     true
 }
@@ -920,9 +1203,19 @@ fn control_transfer_out(c: &mut Controller, setup: u64) -> bool {
     control_transfer(c, setup, None, false)
 }
 
-fn control_transfer(c: &mut Controller, setup: u64, data: Option<(u64, u32)>, data_is_in: bool) -> bool {
+fn control_transfer(
+    c: &mut Controller,
+    setup: u64,
+    data: Option<(u64, u32)>,
+    data_is_in: bool,
+) -> bool {
     let (enqueue, cycle) = *EP0_RING_STATE.lock();
-    let mut ring = Ring { trbs: pmm::phys_to_virt(c.ep0_ring_phys) as *mut Trb, phys: c.ep0_ring_phys, enqueue, cycle };
+    let mut ring = Ring {
+        trbs: pmm::phys_to_virt(c.ep0_ring_phys) as *mut Trb,
+        phys: c.ep0_ring_phys,
+        enqueue,
+        cycle,
+    };
 
     let transfer_type: u32 = match &data {
         Some(_) if data_is_in => 3, // IN data stage present
@@ -933,7 +1226,7 @@ fn control_transfer(c: &mut Controller, setup: u64, data: Option<(u64, u32)>, da
     let setup_trb = Trb {
         parameter: setup,
         status: 8, // TRB transfer length is always 8 for a Setup Stage TRB
-        control: make_type(TRB_TYPE_SETUP_STAGE) | TRB_IOC | (transfer_type << 16) | (1 << 6), // IDT: immediate data
+        control: make_type(TRB_TYPE_SETUP_STAGE) | TRB_CHAIN | (transfer_type << 16) | (1 << 6), // IDT: immediate data
     };
     unsafe { ring.push(setup_trb) };
 
@@ -941,7 +1234,9 @@ fn control_transfer(c: &mut Controller, setup: u64, data: Option<(u64, u32)>, da
         let data_trb = Trb {
             parameter: buf_phys,
             status: len,
-            control: make_type(TRB_TYPE_DATA_STAGE) | TRB_IOC | if data_is_in { 1 << 16 } else { 0 },
+            control: make_type(TRB_TYPE_DATA_STAGE)
+                | TRB_CHAIN
+                | if data_is_in { 1 << 16 } else { 0 },
         };
         unsafe { ring.push(data_trb) };
     }
@@ -953,7 +1248,9 @@ fn control_transfer(c: &mut Controller, setup: u64, data: Option<(u64, u32)>, da
     let status_trb = Trb {
         parameter: 0,
         status: 0,
-        control: make_type(TRB_TYPE_STATUS_STAGE) | TRB_IOC | if status_is_in { 1 << 16 } else { 0 },
+        control: make_type(TRB_TYPE_STATUS_STAGE)
+            | TRB_IOC
+            | if status_is_in { 1 << 16 } else { 0 },
     };
     let status_slot_phys = unsafe { ring.push(status_trb) };
 
@@ -963,13 +1260,14 @@ fn control_transfer(c: &mut Controller, setup: u64, data: Option<(u64, u32)>, da
     reg_write32(unsafe { c.db.add(c.slot_id as usize) }, 1);
 
     let mut saw_completion = false;
-    let responded = spin_until(500_000, || {
+    let responded = spin_until(1_000, || {
         if let Some(ev) = poll_event_ring(c) {
             if trb_type(ev.control) == TRB_TYPE_TRANSFER_EVENT && ev.parameter == status_slot_phys {
                 let code = (ev.status >> 24) & 0xFF;
                 saw_completion = code == COMPLETION_SUCCESS || code == COMPLETION_SHORT_PACKET;
                 return true;
             }
+            dispatch_keyboard_event(c, ev);
         }
         false
     });
@@ -980,13 +1278,17 @@ fn control_transfer(c: &mut Controller, setup: u64, data: Option<(u64, u32)>, da
 /// receive the next report, and ring its doorbell. Called once at setup
 /// and again after every report `poll()` picks up, so there's always
 /// exactly one outstanding read.
-fn submit_report_read(c: &mut Controller) {
-    let Some(ring) = c.keyboard_ring.as_mut() else { return };
-    let trb = Trb { parameter: c.report_phys, status: 8, control: make_type(TRB_TYPE_NORMAL) | TRB_IOC | (1 << 5) };
-    unsafe { ring.push(trb) };
-    // DCI 3 = EP1 IN, matching the endpoint configured in
-    // `try_setup_keyboard`.
-    reg_write32(unsafe { c.db.add(c.slot_id as usize) }, 3);
+fn submit_report_read(db: *mut u32, keyboard: &mut UsbKeyboard) {
+    let trb = Trb {
+        parameter: keyboard.report_phys,
+        status: 8,
+        control: make_type(TRB_TYPE_NORMAL) | TRB_IOC | (1 << 5),
+    };
+    unsafe { keyboard.ring.push(trb) };
+    reg_write32(
+        unsafe { db.add(keyboard.slot_id as usize) },
+        keyboard.dci as u32,
+    );
 }
 
 /// Service the event ring for a completed keyboard report, if any, and
@@ -999,23 +1301,30 @@ fn submit_report_read(c: &mut Controller) {
 /// already polls `drivers::ps2` every iteration while waiting for a
 /// keypress.
 pub fn poll() {
-    if !KEYBOARD_READY.load(Ordering::Acquire) {
-        return;
-    }
     let mut guard = CONTROLLER.lock();
     let Some(c) = guard.as_mut() else { return };
 
     let Some(ev) = poll_event_ring(c) else { return };
+    dispatch_keyboard_event(c, ev);
+}
+
+fn dispatch_keyboard_event(c: &mut Controller, ev: Trb) {
     if trb_type(ev.control) != TRB_TYPE_TRANSFER_EVENT {
         return; // a port status change or stray event; nothing to do
     }
+    let slot_id = (ev.control >> 24) as u8;
+    let dci = ((ev.control >> 16) & 0x1f) as u8;
+    let db = c.db;
+    let Some(keyboard) = c.keyboards.iter_mut().find(|k| k.slot_id == slot_id && k.dci == dci) else {
+        return;
+    };
     let completion_code = (ev.status >> 24) & 0xFF;
     if completion_code == COMPLETION_SUCCESS || completion_code == COMPLETION_SHORT_PACKET {
-        handle_report(c);
+        handle_report(keyboard);
     }
     // Always queue the next read regardless of completion code -- a
     // transient error on one report shouldn't stop future ones.
-    submit_report_read(c);
+    submit_report_read(db, keyboard);
 }
 
 /// USB HID boot-keyboard usage IDs -> ASCII, US layout, unshifted.
@@ -1057,7 +1366,12 @@ struct RingBuffer {
 }
 impl RingBuffer {
     const fn new() -> Self {
-        RingBuffer { buf: [0; 256], head: 0, tail: 0, len: 0 }
+        RingBuffer {
+            buf: [0; 256],
+            head: 0,
+            tail: 0,
+            len: 0,
+        }
     }
     fn push(&mut self, byte: u8) {
         if self.len == 256 {
@@ -1080,16 +1394,17 @@ impl RingBuffer {
 }
 static ASCII_QUEUE: IrqMutex<RingBuffer> = IrqMutex::new(RingBuffer::new());
 
-fn handle_report(c: &mut Controller) {
-    let report = unsafe { core::slice::from_raw_parts(pmm::phys_to_virt(c.report_phys), 8) };
+fn handle_report(keyboard: &mut UsbKeyboard) {
+    let report = unsafe { core::slice::from_raw_parts(pmm::phys_to_virt(keyboard.report_phys), 8) };
     let modifiers = report[0];
-    let keys = [report[2], report[3], report[4], report[5], report[6], report[7]];
+    let keys = [
+        report[2], report[3], report[4], report[5], report[6], report[7],
+    ];
 
     let shift = modifiers & (MOD_LSHIFT | MOD_RSHIFT) != 0;
 
-    let mut prev = PREV_KEYS.lock();
     for &code in &keys {
-        if code == 0 || prev.contains(&code) {
+        if code == 0 || keyboard.prev_keys.contains(&code) {
             continue; // no key in this slot, or already down last report
         }
         if code == HID_KEYCODE_CAPS_LOCK {
@@ -1101,7 +1416,11 @@ fn handle_report(c: &mut Controller) {
             continue;
         }
         let caps = CAPS_LOCK.load(Ordering::Relaxed);
-        let mut ascii = if shift { HID_SHIFTED[code as usize] } else { HID_UNSHIFTED[code as usize] };
+        let mut ascii = if shift {
+            HID_SHIFTED[code as usize]
+        } else {
+            HID_UNSHIFTED[code as usize]
+        };
         if ascii == 0 {
             continue;
         }
@@ -1112,7 +1431,7 @@ fn handle_report(c: &mut Controller) {
         }
         ASCII_QUEUE.lock().push(ascii);
     }
-    *prev = keys;
+    keyboard.prev_keys = keys;
 }
 
 /// Non-blocking: `Some(byte)` if a translated USB keystroke is waiting,
