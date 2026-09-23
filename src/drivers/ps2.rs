@@ -21,7 +21,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::IrqMutex;
-use crate::{idt, pic};
+use crate::idt;
 use crate::{log_fail, log_ok};
 
 const DATA_PORT: u16 = 0x60;
@@ -254,7 +254,7 @@ pub fn init() {
     }
 
     idt::register_irq(IRQ_LINE, on_key_irq);
-    pic::unmask(IRQ_LINE);
+    crate::interrupts::unmask_isa_irq(IRQ_LINE);
     READY.store(true, Ordering::Release);
 
     log_ok!("PS2", "Init", "Controller and keyboard ready, IRQ1 registered and unmasked");

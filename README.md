@@ -22,6 +22,14 @@ Use `./runb.sh` for a normal build, which suppresses `DEBUG` log lines and
 creates `build/iso_output/eonos.iso`. Use `./runb.sh --debug` to include
 `DEBUG` logs and create `build/iso_output/eonos_debugbuild.iso`.
 
-The initramfs is mounted as `/`. The build also includes a read-only FAT32
-image mounted at `/disk`; use `ls`, `cat /disk/README.TXT`, or
-`exec /disk/HELLO.ELF` from the shell to access it.
+The initramfs is mounted as `/`. The build also includes a FAT32 image
+mounted at `/disk`. FAT32 supports short and long names, file writes, directory
+creation, and removal. Shell commands include `mkdir`, `rm`, `touch`, `cp`,
+and `write`; for example, `mkdir /disk/notes` followed by
+`write /disk/notes/todo.txt remember`. `edit /disk/notes/todo.txt` opens a
+small line-oriented editor: enter lines to append, `.save` to write, or
+`.quit` to leave. `cp source destination` copies files in 4 KiB chunks.
+
+Changes live in a sparse RAM overlay and are lost when the machine reboots.
+The initramfs remains read-only. Use `ls`, `cat /disk/README.TXT`, or
+`exec /disk/HELLO.ELF` to access the bundled files.

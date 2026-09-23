@@ -10,9 +10,10 @@ const GATE_INTERRUPT: u8 = 0x8E;
 
 /// Vector the remapped PIC's IRQ0 lands on (see `pic::IRQ_BASE`); IRQs
 /// occupy vectors [IRQ_BASE, IRQ_BASE + IRQ_COUNT).
-const IRQ_BASE: usize = 32;
-const IRQ_COUNT: usize = 16;
+pub const IRQ_BASE: usize = 32;
+pub const IRQ_COUNT: usize = 16;
 const TOTAL_VECTORS: usize = IRQ_BASE + IRQ_COUNT;
+const APIC_SPURIOUS_VECTOR: usize = 0xFF;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -65,8 +66,9 @@ type IrqHandler = fn();
 
 static IRQ_HANDLERS: IrqMutex<[Option<IrqHandler>; IRQ_COUNT]> = IrqMutex::new([None; IRQ_COUNT]);
 
-/// Wire `handler` up to fire whenever IRQ `irq` (0-15, as delivered by
-/// the PIC) arrives. Does not unmask the line — call `pic::unmask` too.
+/// Wire `handler` up to fire whenever ISA IRQ `irq` (0-15) arrives.
+/// Does not unmask the line; use `interrupts::unmask_isa_irq` after
+/// registering the handler.
 pub fn register_irq(irq: u8, handler: IrqHandler) {
     IRQ_HANDLERS.lock()[irq as usize] = Some(handler);
 }
@@ -205,6 +207,9 @@ isr_stub_\num:
     isr_noerr 46
     isr_noerr 47
 
+.global isr_stub_255
+    isr_noerr 255
+
 isr_common:
     push rax
     push rbx
@@ -300,6 +305,7 @@ isr_stub_table:
 #[allow(non_upper_case_globals)]
 extern "C" {
     static isr_stub_table: [u64; TOTAL_VECTORS];
+    static isr_stub_255: u8;
 }
 
 pub fn init() {
@@ -312,6 +318,12 @@ pub fn init() {
             idt.add(vector)
                 .write(Entry::new(handler, KERNEL_CS, ist, GATE_INTERRUPT));
         }
+        idt.add(APIC_SPURIOUS_VECTOR).write(Entry::new(
+            addr_of!(isr_stub_255) as u64,
+            KERNEL_CS,
+            0,
+            GATE_INTERRUPT,
+        ));
 
         let idtr = Idtr {
             limit: (core::mem::size_of::<[Entry; IDT_ENTRIES]>() - 1) as u16,
@@ -335,6 +347,11 @@ pub fn init() {
 
 #[no_mangle]
 extern "C" fn exception_handler(frame: &mut InterruptFrame) {
+    if frame.vector as usize == APIC_SPURIOUS_VECTOR {
+        // Intel specifies that a spurious Local APIC interrupt is not
+        // in service and must not receive an EOI.
+        return;
+    }
     if frame.vector as usize >= IRQ_BASE {
         irq_dispatch(frame);
         return;
@@ -406,7 +423,7 @@ fn irq_dispatch(frame: &InterruptFrame) {
         None => log_debug!("IRQ", "Unhandled", "IRQ{} fired with no registered handler", irq),
     }
 
-    crate::pic::end_of_interrupt(irq);
+    crate::interrupts::end_of_interrupt(irq);
 
     // Now that the PIC is free to deliver more interrupts, the scheduler
     // may switch to another thread from inside this handler.

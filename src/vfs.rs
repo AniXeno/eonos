@@ -1,5 +1,5 @@
 //! Small path-based VFS. Filesystems are mounted at path prefixes and
-//! implement read-only lookup/listing for now.
+//! implement lookup/listing, with writes currently supported by FAT32 mounts.
 
 #![allow(dead_code)]
 
@@ -18,6 +18,11 @@ pub enum FsError {
     Io,
     InvalidPath,
     TooLarge,
+    ReadOnly,
+    NoSpace,
+    InvalidName,
+    AlreadyExists,
+    DirectoryNotEmpty,
 }
 
 enum Filesystem {
@@ -130,6 +135,56 @@ pub fn read_at(path: &str, offset: usize, out: &mut [u8]) -> Result<usize, FsErr
             Ok(n)
         }
         Filesystem::Fat32(fs) => fs.read_at(inner, offset, out).map_err(map_fat_error),
+    }
+}
+
+pub fn create_file(path: &str) -> Result<(), FsError> {
+    let path = normalize(path)?;
+    let mounts = MOUNTS.lock();
+    let (mount, inner) = route(&mounts, &path).ok_or(FsError::NotFound)?;
+    match &mount.fs {
+        Filesystem::Initramfs => Err(FsError::ReadOnly),
+        Filesystem::Fat32(fs) => fs.create_file(inner).map_err(map_fat_error),
+    }
+}
+
+pub fn create_dir(path: &str) -> Result<(), FsError> {
+    let path = normalize(path)?;
+    let mounts = MOUNTS.lock();
+    let (mount, inner) = route(&mounts, &path).ok_or(FsError::NotFound)?;
+    match &mount.fs {
+        Filesystem::Initramfs => Err(FsError::ReadOnly),
+        Filesystem::Fat32(fs) => fs.create_dir(inner).map_err(map_fat_error),
+    }
+}
+
+pub fn remove(path: &str) -> Result<(), FsError> {
+    let path = normalize(path)?;
+    let mounts = MOUNTS.lock();
+    let (mount, inner) = route(&mounts, &path).ok_or(FsError::NotFound)?;
+    match &mount.fs {
+        Filesystem::Initramfs => Err(FsError::ReadOnly),
+        Filesystem::Fat32(fs) => fs.remove(inner).map_err(map_fat_error),
+    }
+}
+
+pub fn truncate(path: &str) -> Result<(), FsError> {
+    let path = normalize(path)?;
+    let mounts = MOUNTS.lock();
+    let (mount, inner) = route(&mounts, &path).ok_or(FsError::NotFound)?;
+    match &mount.fs {
+        Filesystem::Initramfs => Err(FsError::ReadOnly),
+        Filesystem::Fat32(fs) => fs.truncate(inner).map_err(map_fat_error),
+    }
+}
+
+pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+    let path = normalize(path)?;
+    let mounts = MOUNTS.lock();
+    let (mount, inner) = route(&mounts, &path).ok_or(FsError::NotFound)?;
+    match &mount.fs {
+        Filesystem::Initramfs => Err(FsError::ReadOnly),
+        Filesystem::Fat32(fs) => fs.write_at(inner, offset, data).map_err(map_fat_error),
     }
 }
 
@@ -253,6 +308,10 @@ fn map_fat_error(e: crate::fat32::FatError) -> FsError {
         F::IsDirectory => FsError::IsDirectory,
         F::Io => FsError::Io,
         F::TooLarge => FsError::TooLarge,
+        F::NoSpace => FsError::NoSpace,
+        F::InvalidName => FsError::InvalidName,
+        F::AlreadyExists => FsError::AlreadyExists,
+        F::DirectoryNotEmpty => FsError::DirectoryNotEmpty,
         _ => FsError::Io,
     }
 }

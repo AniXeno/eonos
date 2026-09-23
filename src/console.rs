@@ -1,4 +1,6 @@
 use core::fmt;
+use alloc::vec;
+use alloc::vec::Vec;
 use crate::sync::IrqMutex;
 
 use crate::framebuffer::FbInfo;
@@ -84,6 +86,7 @@ enum EscState {
 
 pub struct Console {
     addr: *mut u8,
+    shadow: Vec<u8>,
     width: usize,
     height: usize,
     pitch: usize,
@@ -111,11 +114,13 @@ impl Console {
     fn new(fb: &FbInfo, font: Font) -> Self {
         let width = fb.width as usize;
         let height = fb.height as usize;
+        let pitch = fb.pitch as usize;
         Self {
             addr: fb.addr,
+            shadow: vec![0; pitch.saturating_mul(height)],
             width,
             height,
-            pitch: fb.pitch as usize,
+            pitch,
             bytes_per_pixel: (fb.bpp as usize) / 8,
             font,
             cols: width / font.width,
@@ -138,24 +143,49 @@ impl Console {
             return;
         }
         let offset = y * self.pitch + x * self.bytes_per_pixel;
-        unsafe {
-            let ptr = self.addr.add(offset);
-            if self.bytes_per_pixel == 4 {
-                (ptr as *mut u32).write_volatile(color);
-            } else {
-                ptr.write_volatile(color as u8);
-                ptr.add(1).write_volatile((color >> 8) as u8);
-                ptr.add(2).write_volatile((color >> 16) as u8);
-            }
+        self.shadow[offset] = color as u8;
+        self.shadow[offset + 1] = (color >> 8) as u8;
+        self.shadow[offset + 2] = (color >> 16) as u8;
+        if self.bytes_per_pixel == 4 {
+            self.shadow[offset + 3] = (color >> 24) as u8;
         }
     }
 
     fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
         let x_end = (x + w).min(self.width);
         let y_end = (y + h).min(self.height);
+        let bpp = self.bytes_per_pixel;
         for py in y..y_end {
-            for px in x..x_end {
-                self.put_pixel(px, py, color);
+            let start = py * self.pitch + x * bpp;
+            let row = &mut self.shadow[start..start + (x_end - x) * bpp];
+            if color == 0 {
+                row.fill(0);
+            } else {
+                for pixel in row.chunks_exact_mut(bpp) {
+                    pixel[0] = color as u8;
+                    pixel[1] = (color >> 8) as u8;
+                    pixel[2] = (color >> 16) as u8;
+                    if bpp == 4 { pixel[3] = (color >> 24) as u8; }
+                }
+            }
+        }
+    }
+
+    /// Copy a changed rectangle from cached RAM to the write-combining
+    /// framebuffer. Reads and scrolling stay in ordinary RAM; the device
+    /// mapping only sees forward, contiguous writes.
+    fn flush_rect(&self, x: usize, y: usize, w: usize, h: usize) {
+        let x_end = x.saturating_add(w).min(self.width);
+        let y_end = y.saturating_add(h).min(self.height);
+        let row_bytes = (x_end - x) * self.bytes_per_pixel;
+        for py in y..y_end {
+            let offset = py * self.pitch + x * self.bytes_per_pixel;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.shadow.as_ptr().add(offset),
+                    self.addr.add(offset),
+                    row_bytes,
+                );
             }
         }
     }
@@ -167,6 +197,7 @@ impl Console {
     pub fn clear(&mut self) {
         let bg = self.bg;
         self.fill_rect(0, 0, self.width, self.height, bg);
+        self.flush_rect(0, 0, self.width, self.height);
         self.cursor_col = 0;
         self.cursor_row = 0;
     }
@@ -185,6 +216,7 @@ impl Console {
                 self.put_pixel(ox + x, oy + y, if on { fg } else { bg });
             }
         }
+        self.flush_rect(ox, oy, font.width, font.height);
     }
 
     fn newline(&mut self) {
@@ -199,12 +231,11 @@ impl Console {
     fn scroll(&mut self) {
         let row_bytes = self.font.height * self.pitch;
         let text_bytes = self.rows * row_bytes;
-        unsafe {
-            core::ptr::copy(self.addr.add(row_bytes), self.addr, text_bytes - row_bytes);
-        }
+        self.shadow.copy_within(row_bytes..text_bytes, 0);
         let y = (self.rows - 1) * self.font.height;
         let h = self.font.height;
         self.fill_rect(0, y, self.width, h, DEFAULT_BG);
+        self.flush_rect(0, 0, self.width, text_bytes / self.pitch);
     }
 
     fn put_printable(&mut self, c: char) {

@@ -50,6 +50,13 @@ struct Record {
     status: Option<i64>,
 }
 
+/// Stable copy of one process record for user-facing inspection.
+pub struct ProcessInfo {
+    pub pid: u64,
+    pub name: String,
+    pub exit_status: Option<i64>,
+}
+
 static PROCS: IrqMutex<Vec<Record>> = IrqMutex::new(Vec::new());
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,6 +131,20 @@ pub fn take_exit_status(pid: u64) -> Option<i64> {
         .iter()
         .position(|r| r.pid == pid && r.status.is_some())?;
     procs.swap_remove(i).status
+}
+
+/// Return a snapshot without keeping the process-table lock held while
+/// callers format or copy the result.
+pub fn list() -> Vec<ProcessInfo> {
+    PROCS
+        .lock()
+        .iter()
+        .map(|record| ProcessInfo {
+            pid: record.pid,
+            name: record.name.clone(),
+            exit_status: record.status,
+        })
+        .collect()
 }
 
 /// Map the user stack and lay out its initial contents the way the

@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod blocking;
 pub mod block;
+pub mod acpi;
 pub mod console;
 pub mod drivers;
 pub mod elf;
@@ -13,8 +14,11 @@ pub mod framebuffer;
 pub mod gdt;
 pub mod heap;
 pub mod idt;
+pub mod interrupts;
+pub mod ioapic;
 pub mod initramfs;
 pub mod logger;
+pub mod lapic;
 pub mod panic_screen;
 pub mod pic;
 pub mod pit;
@@ -54,7 +58,6 @@ unsafe extern "C" fn _start() -> ! {
     framebuffer::init();
     framebuffer::self_test();
     framebuffer::bench("pre-VMM, bootloader mapping");
-    console::init();
 
     gdt::init();
     idt::init();
@@ -74,15 +77,33 @@ unsafe extern "C" fn _start() -> ! {
     framebuffer::bench("post-VMM, write-combining");
 
     heap::init();
+    // Console shadow storage uses the kernel heap. Bring the console up
+    // after VMM/heap so rendering and scrollback never read from WC memory.
+    console::init();
     heap::self_test();
 
     pic::init();
+    let mut apic_ready = false;
+    if let Some(madt) = acpi::find_madt() {
+        if ioapic::init(&madt)
+            && ioapic::supports_isa_irq(0)
+            && ioapic::supports_isa_irq(1)
+            && lapic::init(madt.local_apic_addr)
+        {
+            interrupts::use_apic();
+            apic_ready = true;
+            log_ok!("APIC", "Init", "I/O APIC interrupt routing enabled");
+        }
+    }
+    if !apic_ready {
+        log_ok!("IRQ", "Init", "APIC setup unavailable; continuing with legacy PIC routing");
+    }
     pit::init(1000); // 1kHz tick, i.e. 1ms resolution
     idt::enable_interrupts();
     pit::self_test();
 
-    // Keyboard drivers need the PIC/IDT (for IRQ1) already up, which
-    // they are by this point, but come before the scheduler so a typed
+    // Keyboard drivers need the IDT and interrupt controller (for IRQ1)
+    // already up, but come before the scheduler so a typed
     // command doesn't have to wait on anything else finishing init.
     drivers::ps2::init();
     drivers::usb::init();

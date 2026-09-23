@@ -8,6 +8,8 @@
 #                                       mode, echoed by the kernel, from
 #                                       the PS/2 keyboard and/or COM1.
 #     1  write(fd, buf, len)
+#     2  open(path, path_len, flags)
+#     3  close(fd)
 #    24  sched_yield()
 #    39  getpid()
 #    60  exit(status)
@@ -19,8 +21,11 @@
 #                                     -- whole-file read by path.
 #                                       Stopgap for `cat`.
 #  9003  eonos_uptime_ms()           -- milliseconds since boot.
+#  9006  eonos_list_processes(buf, len)
 #
-# Commands: ls, cat <file>, echo <text>, clear, uptime, pid, help, exit.
+# Commands: ls, cat <file>, exec <file>, write <file> <text>,
+# echo <text>, ps, clear,
+# uptime, pid, help, exit.
 # No pipes, no scripting -- just enough to poke around from a prompt.
 
 .intel_syntax noprefix
@@ -33,13 +38,16 @@ file_buf:   .skip 4096
 FILE_CAP = 4096
 numbuf:     .skip 24                # enough for any 64-bit value in decimal
 wait_status: .skip 4
+edit_path:   .skip 256
+edit_path_len: .skip 8
+edit_size:   .skip 8
 
 .section .rodata
 msg_banner:   .ascii "EonOS shell -- type 'help' for commands\n"
 .equ msg_banner_len, . - msg_banner
 prompt:       .ascii "eonsh> "
 .equ prompt_len, . - prompt
-msg_help:     .ascii "commands: ls, cat <file>, exec <file>, echo <text>, clear, uptime, pid, help, exit\n"
+msg_help:     .ascii "commands: ls, cat, exec, write, mkdir, rm, touch, cp, edit, echo, ps, clear, uptime, pid, help, exit\n"
 .equ msg_help_len, . - msg_help
 msg_unknown:  .ascii "unknown command: "
 .equ msg_unknown_len, . - msg_unknown
@@ -47,8 +55,28 @@ msg_notfound: .ascii "cat: no such file\n"
 .equ msg_notfound_len, . - msg_notfound
 msg_exec_error: .ascii "exec: unable to launch file\n"
 .equ msg_exec_error_len, . - msg_exec_error
+msg_ps_error: .ascii "ps: unable to list processes\n"
+.equ msg_ps_error_len, . - msg_ps_error
+msg_write_ok: .ascii "write: saved\n"
+.equ msg_write_ok_len, . - msg_write_ok
+msg_write_error: .ascii "write: failed (use a valid FAT32 path under /disk)\n"
+.equ msg_write_error_len, . - msg_write_error
 msg_toobig:   .ascii "cat: file too large to display\n"
 .equ msg_toobig_len, . - msg_toobig
+msg_mkdir_error: .ascii "mkdir: failed\n"
+.equ msg_mkdir_error_len, . - msg_mkdir_error
+msg_rm_error: .ascii "rm: failed\n"
+.equ msg_rm_error_len, . - msg_rm_error
+msg_touch_error: .ascii "touch: failed\n"
+.equ msg_touch_error_len, . - msg_touch_error
+msg_edit_header: .ascii " EonOS nano -- append lines, .save writes, .quit exits\n"
+.equ msg_edit_header_len, . - msg_edit_header
+msg_edit_prompt: .ascii "nano> "
+.equ msg_edit_prompt_len, . - msg_edit_prompt
+msg_edit_saved: .ascii "[ saved ]\n"
+.equ msg_edit_saved_len, . - msg_edit_saved
+msg_edit_error: .ascii "edit: failed (file or 4 KiB buffer limit)\n"
+.equ msg_edit_error_len, . - msg_edit_error
 msg_uptime_suffix: .ascii " ms\n"
 .equ msg_uptime_suffix_len, . - msg_uptime_suffix
 newline:      .ascii "\n"
@@ -60,9 +88,18 @@ cmd_exit:     .ascii "exit"
 cmd_clear:    .ascii "clear"
 cmd_uptime:   .ascii "uptime"
 cmd_pid:      .ascii "pid"
+cmd_ps:       .ascii "ps"
 cmd_cat:      .ascii "cat "   # note trailing space: "cat" alone is not this
 cmd_exec:     .ascii "exec "
+cmd_write:    .ascii "write "
 cmd_echo:     .ascii "echo "  # same convention; bare "echo" prints nothing
+cmd_mkdir:    .ascii "mkdir "
+cmd_rm:       .ascii "rm "
+cmd_touch:    .ascii "touch "
+cmd_cp:       .ascii "cp "
+cmd_edit:     .ascii "edit "
+cmd_save:     .ascii ".save"
+cmd_quit:     .ascii ".quit"
 
 .section .text
 .global _start
@@ -146,12 +183,12 @@ _start:
 
 .Ltry_exec:
     cmp  rcx, 6
-    jle  .Ltry_echo
+    jle  .Ltry_write
     lea  rdi, [rip + cmd_exec]
     mov  r8, 5
     call strprefix
     test rax, rax
-    jz   .Ltry_echo
+    jz   .Ltry_write
     lea  rdi, [rip + line_buf + 5]      # path pointer (arg 1)
     mov  rsi, rcx                       # path length (arg 2)
     sub  rsi, 5
@@ -168,6 +205,224 @@ _start:
     lea  rsi, [rip + msg_exec_error]
     mov  edx, msg_exec_error_len
     call print
+    jmp  .Lloop
+
+.Ltry_write:
+    cmp  rcx, 8
+    jle  .Ltry_mkdir
+    lea  rdi, [rip + cmd_write]
+    mov  r8, 6
+    call strprefix
+    test rax, rax
+    jz   .Ltry_mkdir
+    lea  r12, [rip + line_buf + 6]
+    mov  r13, rcx
+    sub  r13, 6
+    xor  r14d, r14d
+.Lwrite_find_space:
+    cmp  r14, r13
+    je   .Lwrite_error
+    cmp  byte ptr [r12 + r14], ' '
+    je   .Lwrite_path_found
+    inc  r14
+    jmp  .Lwrite_find_space
+.Lwrite_path_found:
+    lea  r15, [r12 + r14 + 1]
+    sub  r13, r14
+    dec  r13                            # data length after the separator
+    mov  rdi, r12                       # path
+    mov  rsi, r14                       # path length
+    mov  edx, 577                       # O_WRONLY | O_CREAT | O_TRUNC
+    mov  eax, 2                         # open
+    syscall
+    test rax, rax
+    js   .Lwrite_error
+    mov  rbx, rax                       # fd
+    mov  rdi, rbx
+    mov  rsi, r15                       # text
+    mov  rdx, r13                       # text length
+    mov  eax, 1                         # write
+    syscall
+    test rax, rax
+    js   .Lwrite_close_error
+    mov  rdi, rbx
+    mov  eax, 3                         # close
+    syscall
+    lea  rsi, [rip + msg_write_ok]
+    mov  edx, msg_write_ok_len
+    call print
+    jmp  .Lloop
+.Lwrite_close_error:
+    mov  rdi, rbx
+    mov  eax, 3
+    syscall
+.Lwrite_error:
+    lea  rsi, [rip + msg_write_error]
+    mov  edx, msg_write_error_len
+    call print
+    jmp  .Lloop
+
+.Ltry_mkdir:
+    cmp  rcx, 7
+    jle  .Ltry_rm
+    lea  rdi, [rip + cmd_mkdir]
+    mov  r8, 6
+    call strprefix
+    test rax, rax
+    jz   .Ltry_rm
+    lea  rdi, [rip + line_buf + 6]
+    mov  rsi, rcx
+    sub  rsi, 6
+    mov  eax, 9007
+    syscall
+    test rax, rax
+    js   .Lmkdir_error
+    jmp  .Lloop
+.Lmkdir_error:
+    lea  rsi, [rip + msg_mkdir_error]
+    mov  edx, msg_mkdir_error_len
+    call print
+    jmp  .Lloop
+
+.Ltry_rm:
+    cmp  rcx, 4
+    jle  .Ltry_touch
+    lea  rdi, [rip + cmd_rm]
+    mov  r8, 3
+    call strprefix
+    test rax, rax
+    jz   .Ltry_touch
+    lea  rdi, [rip + line_buf + 3]
+    mov  rsi, rcx
+    sub  rsi, 3
+    mov  eax, 9008
+    syscall
+    test rax, rax
+    js   .Lrm_error
+    jmp  .Lloop
+.Lrm_error:
+    lea  rsi, [rip + msg_rm_error]
+    mov  edx, msg_rm_error_len
+    call print
+    jmp  .Lloop
+
+.Ltry_touch:
+    cmp  rcx, 7
+    jle  .Ltry_cp
+    lea  rdi, [rip + cmd_touch]
+    mov  r8, 6
+    call strprefix
+    test rax, rax
+    jz   .Ltry_cp
+    lea  rdi, [rip + line_buf + 6]
+    mov  rsi, rcx
+    sub  rsi, 6
+    mov  edx, 65                       # O_WRONLY | O_CREAT
+    mov  eax, 2
+    syscall
+    test rax, rax
+    js   .Ltouch_error
+    mov  rdi, rax
+    mov  eax, 3
+    syscall
+    jmp  .Lloop
+.Ltouch_error:
+    lea  rsi, [rip + msg_touch_error]
+    mov  edx, msg_touch_error_len
+    call print
+    jmp  .Lloop
+
+.Ltry_cp:
+    cmp  rcx, 6
+    jle  .Ltry_edit
+    lea  rdi, [rip + cmd_cp]
+    mov  r8, 3
+    call strprefix
+    test rax, rax
+    jz   .Ltry_edit
+    lea  r12, [rip + line_buf + 3]
+    mov  r13, rcx
+    sub  r13, 3
+    xor  r14d, r14d
+.Lcp_find_space:
+    cmp  r14, r13
+    je   .Ltry_edit
+    cmp  byte ptr [r12 + r14], ' '
+    je   .Lcp_path_found
+    inc  r14
+    jmp  .Lcp_find_space
+.Lcp_path_found:
+    lea  r15, [r12 + r14 + 1]
+    mov  rbx, r13
+    sub  rbx, r14
+    dec  rbx
+    mov  rdi, r12
+    mov  rsi, r14
+    xor  edx, edx                     # O_RDONLY
+    mov  eax, 2
+    syscall
+    test rax, rax
+    js   .Lcopy_error
+    mov  r12, rax                     # source fd
+    mov  rdi, r15
+    mov  rsi, rbx
+    mov  edx, 577                     # O_WRONLY|O_CREAT|O_TRUNC
+    mov  eax, 2
+    syscall
+    test rax, rax
+    js   .Lcopy_close_source
+    mov  r13, rax                     # destination fd
+.Lcopy_loop:
+    mov  rdi, r12
+    lea  rsi, [rip + file_buf]
+    mov  edx, FILE_CAP
+    xor  eax, eax
+    syscall
+    test rax, rax
+    js   .Lcopy_close_both
+    jz   .Lcopy_done
+    mov  rdx, rax
+    mov  rdi, r13
+    lea  rsi, [rip + file_buf]
+    mov  eax, 1
+    syscall
+    cmp  rax, rdx
+    jne  .Lcopy_close_both
+    jmp  .Lcopy_loop
+.Lcopy_done:
+    mov  rdi, r12
+    mov  eax, 3
+    syscall
+    mov  rdi, r13
+    mov  eax, 3
+    syscall
+    jmp  .Lloop
+.Lcopy_close_both:
+    mov  rdi, r13
+    mov  eax, 3
+    syscall
+.Lcopy_close_source:
+    mov  rdi, r12
+    mov  eax, 3
+    syscall
+.Lcopy_error:
+    lea  rsi, [rip + msg_write_error]
+    mov  edx, msg_write_error_len
+    call print
+    jmp  .Lloop
+
+.Ltry_edit:
+    cmp  rcx, 6
+    jle  .Ltry_echo
+    lea  rdi, [rip + cmd_edit]
+    mov  r8, 5
+    call strprefix
+    test rax, rax
+    jz   .Ltry_echo
+    lea  rsi, [rip + line_buf + 5]
+    mov  rdx, rcx
+    sub  rdx, 5
+    call do_edit
     jmp  .Lloop
 
 .Ltry_echo:
@@ -214,13 +469,24 @@ _start:
 
 .Ltry_pid:
     cmp  rcx, 3
-    jne  .Lunknown
+    jne  .Ltry_ps
     lea  rdi, [rip + cmd_pid]
     mov  r8, rcx
     call streq
     test rax, rax
-    jz   .Lunknown
+    jz   .Ltry_ps
     call do_pid
+    jmp  .Lloop
+
+.Ltry_ps:
+    cmp  rcx, 2
+    jne  .Lunknown
+    lea  rdi, [rip + cmd_ps]
+    mov  r8, rcx
+    call streq
+    test rax, rax
+    jz   .Lunknown
+    call do_ps
     jmp  .Lloop
 
 .Lunknown:
@@ -261,6 +527,30 @@ do_ls:
     ret
 
 # ---------------------------------------------------------------------
+# do_ps: display the kernel's tracked user process records.
+# ---------------------------------------------------------------------
+do_ps:
+    push rbx
+    lea  rdi, [rip + file_buf]
+    mov  esi, FILE_CAP
+    mov  eax, 9006                      # eonos_list_processes
+    syscall
+    test rax, rax
+    js   1f
+    test rax, rax
+    jz   2f
+    mov  rbx, rax
+    lea  rsi, [rip + file_buf]
+    mov  rdx, rbx
+    call print
+    jmp  2f
+1:  lea  rsi, [rip + msg_ps_error]
+    mov  edx, msg_ps_error_len
+    call print
+2:  pop  rbx
+    ret
+
+# ---------------------------------------------------------------------
 # do_cat: rsi = filename ptr, rdx = filename length.
 # ---------------------------------------------------------------------
 do_cat:
@@ -295,6 +585,136 @@ do_cat:
     mov  edx, 1
     call print
 3:  pop  r13
+    pop  r12
+    pop  rbx
+    ret
+
+# ---------------------------------------------------------------------
+# do_edit: a tiny append-only, line-oriented editor. The canonical input
+# path provides line editing; .save writes the buffer and .quit returns.
+# ---------------------------------------------------------------------
+do_edit:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov  r12, rsi                      # path pointer
+    mov  r13, rdx                      # path length
+    lea  rdi, [rip + edit_path]
+    mov  rsi, r12
+    mov  rcx, r13
+    rep  movsb
+    mov  qword ptr [rip + edit_path_len], r13
+
+    mov  rdi, r12
+    mov  rsi, r13
+    lea  rdx, [rip + file_buf]
+    mov  r10d, FILE_CAP
+    mov  eax, 9002                     # load existing file if present
+    syscall
+    test rax, rax
+    js   .Ledit_new_file
+    mov  r14, rax                      # current buffer size
+    jmp  .Ledit_screen
+.Ledit_new_file:
+    xor  r14d, r14d
+.Ledit_screen:
+    lea  rsi, [rip + clear_seq]
+    mov  edx, clear_seq_len
+    call print
+    lea  rsi, [rip + msg_edit_header]
+    mov  edx, msg_edit_header_len
+    call print
+    lea  rsi, [rip + file_buf]
+    mov  rdx, r14
+    call print
+.Ledit_loop:
+    lea  rsi, [rip + msg_edit_prompt]
+    mov  edx, msg_edit_prompt_len
+    call print
+    lea  rsi, [rip + line_buf]
+    mov  edx, LINE_CAP
+    call read_line
+    test rax, rax
+    jle  .Ledit_loop
+    mov  rbx, rax                      # complete entered line length
+    mov  r15, rax                      # command comparison length
+    lea  rsi, [rip + line_buf]
+    cmp  byte ptr [rsi + r15 - 1], 10
+    jne  .Ledit_compare
+    dec  r15
+.Ledit_compare:
+    cmp  r15, 5
+    jne  .Ledit_check_quit
+    lea  rdi, [rip + cmd_save]
+    mov  rcx, r15
+    mov  r8, 5
+    call streq
+    test rax, rax
+    jnz  .Ledit_save
+.Ledit_check_quit:
+    cmp  r15, 5
+    jne  .Ledit_append
+    lea  rdi, [rip + cmd_quit]
+    lea  rsi, [rip + line_buf]
+    mov  rcx, r15
+    mov  r8, 5
+    call streq
+    test rax, rax
+    jnz  .Ledit_return
+.Ledit_append:
+    mov  rax, rbx                       # append line including its newline
+    cmp  r14, FILE_CAP
+    jae  .Ledit_error
+    lea  rdi, [rip + file_buf]
+    add  rdi, r14
+    lea  rsi, [rip + line_buf]
+    mov  rcx, rax
+    mov  rdx, r14
+    add  rdx, rcx
+    cmp  rdx, FILE_CAP
+    ja   .Ledit_error
+    rep  movsb
+    add  r14, rax
+    jmp  .Ledit_loop
+.Ledit_save:
+    lea  rdi, [rip + edit_path]
+    mov  rsi, qword ptr [rip + edit_path_len]
+    mov  edx, 577                      # O_WRONLY | O_CREAT | O_TRUNC
+    mov  eax, 2
+    syscall
+    test rax, rax
+    js   .Ledit_error
+    mov  r12, rax
+    mov  rdi, r12
+    lea  rsi, [rip + file_buf]
+    mov  rdx, r14
+    mov  eax, 1
+    syscall
+    cmp  rax, r14
+    jne  .Ledit_write_failed
+    mov  rdi, r12
+    mov  eax, 3
+    syscall
+    lea  rsi, [rip + msg_edit_saved]
+    mov  edx, msg_edit_saved_len
+    call print
+    jmp  .Ledit_loop
+.Ledit_write_failed:
+    mov  rdi, r12
+    mov  eax, 3
+    syscall
+    jmp  .Ledit_error
+.Ledit_error:
+    lea  rsi, [rip + msg_edit_error]
+    mov  edx, msg_edit_error_len
+    call print
+    jmp  .Ledit_return
+.Ledit_return:
+    pop  r15
+    pop  r14
+    pop  r13
     pop  r12
     pop  rbx
     ret

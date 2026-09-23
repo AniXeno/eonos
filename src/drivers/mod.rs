@@ -7,7 +7,7 @@
 //! Every driver in here follows the same shape as the core drivers that
 //! predate this folder (`pic`, `pit`): an `init()` that programs the
 //! hardware and registers its IRQ handler with `idt::register_irq` +
-//! `pic::unmask`, and a `self_test()` that's safe to call once
+//! `interrupts::unmask_isa_irq`, and a `self_test()` that's safe to call once
 //! interrupts are on. `main.rs` calls both in order.
 
 pub mod ps2;

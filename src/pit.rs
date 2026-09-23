@@ -2,14 +2,14 @@
 //!
 //! This is the kernel's first real hardware interrupt (as opposed to a
 //! CPU-generated exception like the `int3` self-test): it proves the
-//! IDT, the remapped PIC, and `sti` all actually work together, and it
+//! IDT, the interrupt controller, and `sti` all actually work together, and it
 //! gives the future scheduler a tick source.
 
 #![allow(dead_code)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::pic;
+use crate::interrupts;
 use crate::{idt, log_fail, log_ok};
 
 const CHANNEL0_DATA: u16 = 0x40;
@@ -49,7 +49,7 @@ pub fn init(hz: u32) {
     TICKS.store(0, Ordering::Relaxed);
 
     idt::register_irq(IRQ_LINE, on_tick);
-    pic::unmask(IRQ_LINE);
+    interrupts::unmask_isa_irq(IRQ_LINE);
 
     log_ok!(
         "PIT",
