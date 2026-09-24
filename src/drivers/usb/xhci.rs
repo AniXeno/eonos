@@ -303,6 +303,9 @@ fn find_boot_keyboard(config: &[u8], speed: u32) -> Option<BootKeyboardEndpoint>
     }
     let configuration = config[5];
     let mut keyboard_iface = None;
+    let mut interface_count = 0usize;
+    let mut boot_keyboard_count = 0usize;
+    let mut interrupt_in_count = 0usize;
     let mut offset = 9usize;
     while offset + 2 <= total {
         let len = config[offset] as usize;
@@ -312,12 +315,14 @@ fn find_boot_keyboard(config: &[u8], speed: u32) -> Option<BootKeyboardEndpoint>
         }
         match kind {
             4 if len >= 9 => {
+                interface_count += 1;
                 // HID class, boot subclass, keyboard protocol, alternate 0.
                 keyboard_iface = if config[offset + 3] == 0
                     && config[offset + 5] == 3
                     && config[offset + 6] == 1
                     && config[offset + 7] == 1
                 {
+                    boot_keyboard_count += 1;
                     Some(config[offset + 2])
                 } else {
                     None
@@ -327,6 +332,9 @@ fn find_boot_keyboard(config: &[u8], speed: u32) -> Option<BootKeyboardEndpoint>
                 let address = config[offset + 2];
                 let attributes = config[offset + 3];
                 let packet = u16::from_le_bytes([config[offset + 4], config[offset + 5]]) & 0x07ff;
+                if address & 0x80 != 0 && attributes & 0x03 == 0x03 {
+                    interrupt_in_count += 1;
+                }
                 if address & 0x80 != 0
                     && address & 0x0f != 0
                     && attributes & 0x03 == 0x03
@@ -348,6 +356,17 @@ fn find_boot_keyboard(config: &[u8], speed: u32) -> Option<BootKeyboardEndpoint>
         }
         offset += len;
     }
+    log_fail!(
+        "USB",
+        "xHCI",
+        "No boot keyboard endpoint in configuration: len={}, total={}, speed={}, interfaces={}, boot keyboards={}, interrupt-IN endpoints={}",
+        config.len(),
+        total,
+        speed,
+        interface_count,
+        boot_keyboard_count,
+        interrupt_in_count
+    );
     None
 }
 
