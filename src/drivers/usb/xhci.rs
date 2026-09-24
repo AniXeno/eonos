@@ -293,7 +293,7 @@ struct BootKeyboardEndpoint {
     interval: u8,
 }
 
-fn find_boot_keyboard(config: &[u8]) -> Option<BootKeyboardEndpoint> {
+fn find_boot_keyboard(config: &[u8], speed: u32) -> Option<BootKeyboardEndpoint> {
     if config.len() < 9 || config[1] != 2 {
         return None;
     }
@@ -331,6 +331,8 @@ fn find_boot_keyboard(config: &[u8]) -> Option<BootKeyboardEndpoint> {
                     && address & 0x0f != 0
                     && attributes & 0x03 == 0x03
                     && packet >= 8
+                    // Low-speed interrupt endpoints are limited to 8 bytes.
+                    && (speed != 2 || packet == 8)
                 {
                     let endpoint = address & 0x0f;
                     return Some(BootKeyboardEndpoint {
@@ -1033,10 +1035,10 @@ fn try_setup_keyboard(c: &mut Controller, port: u8) -> bool {
         return false;
     }
 
-    // USB 2 full-speed devices report their EP0 packet size in the device
-    // descriptor. The address command must start with 8 bytes; after the
-    // first eight descriptor bytes, update EP0 before any larger request.
-    if speed == 1 {
+    // USB 2 low/full-speed devices report EP0's packet size in the device
+    // descriptor. Start with the mandated 8-byte packet size, read the first
+    // eight bytes, then validate it before requesting the configuration.
+    if speed == 1 || speed == 2 {
         let Some(device_desc_phys) = pmm::alloc_frame_zeroed() else {
             fail_setup!("allocating device descriptor buffer");
         };
@@ -1056,31 +1058,38 @@ fn try_setup_keyboard(c: &mut Controller, port: u8) -> bool {
         }
         let packet_size =
             unsafe { core::ptr::read_volatile(pmm::phys_to_virt(device_desc_phys).add(7)) };
-        if !matches!(packet_size, 8 | 16 | 32 | 64) {
+        let valid_packet_size = match speed {
+            1 => matches!(packet_size, 8 | 16 | 32 | 64),
+            2 => packet_size == 8,
+            _ => false,
+        };
+        if !valid_packet_size {
             fail_setup!("invalid EP0 max packet size");
         }
-        unsafe {
-            let control_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 0);
-            core::ptr::write_bytes(control_ctx, 0, c.context_size / 4);
-            *control_ctx.add(1) = 1 << 1; // update EP0 context only
-            let ep0_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 2);
-            *ep0_ctx.add(1) = (4 << 3) | ((packet_size as u32) << 16) | (3 << 1);
-            *ep0_ctx.add(2) = (c.ep0_ring_phys | 1) as u32;
-            *ep0_ctx.add(3) = (c.ep0_ring_phys >> 32) as u32;
-        }
-        let Some((code, _)) = do_command(
-            c,
-            Trb {
-                parameter: c.input_ctx_phys,
-                status: 0,
-                control: make_type(TRB_TYPE_EVALUATE_CONTEXT) | ((c.slot_id as u32) << 24),
-            },
-        ) else {
-            fail_setup!("Evaluate Context command timeout");
-        };
-        if code != COMPLETION_SUCCESS {
-            log_fail!("USB", "xHCI", "Port {} Evaluate Context failed (completion {})", port, code);
-            return false;
+        if packet_size != 8 {
+            unsafe {
+                let control_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 0);
+                core::ptr::write_bytes(control_ctx, 0, c.context_size / 4);
+                *control_ctx.add(1) = 1 << 1; // update EP0 context only
+                let ep0_ctx = input_context_entry(c.input_ctx_phys, c.context_size, 2);
+                *ep0_ctx.add(1) = (4 << 3) | ((packet_size as u32) << 16) | (3 << 1);
+                *ep0_ctx.add(2) = (c.ep0_ring_phys | 1) as u32;
+                *ep0_ctx.add(3) = (c.ep0_ring_phys >> 32) as u32;
+            }
+            let Some((code, _)) = do_command(
+                c,
+                Trb {
+                    parameter: c.input_ctx_phys,
+                    status: 0,
+                    control: make_type(TRB_TYPE_EVALUATE_CONTEXT) | ((c.slot_id as u32) << 24),
+                },
+            ) else {
+                fail_setup!("Evaluate Context command timeout");
+            };
+            if code != COMPLETION_SUCCESS {
+                log_fail!("USB", "xHCI", "Port {} Evaluate Context failed (completion {})", port, code);
+                return false;
+            }
         }
     }
 
@@ -1125,7 +1134,7 @@ fn try_setup_keyboard(c: &mut Controller, port: u8) -> bool {
         fail_setup!("reading full configuration descriptor");
     }
     let config = unsafe { core::slice::from_raw_parts(desc, total_length) };
-    let Some(keyboard) = find_boot_keyboard(config) else {
+    let Some(keyboard) = find_boot_keyboard(config, speed) else {
         fail_setup!("finding HID boot-keyboard interface");
     };
     let Some(interval) = xhci_interval(speed, keyboard.interval) else {
