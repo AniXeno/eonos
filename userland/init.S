@@ -21,9 +21,10 @@
 #  9009  eonos_sync()                 -- flush mounted storage.
 #  9010  eonos_list_block_devices(buf, len) -- lsblk-style block-device table.
 #
-# Commands: ls, cat <file>, exec <file> [args...], write <file> <text>,
+# Commands: ls, lsblk, mount <device> <directory>, cat <file>,
+# exec <file> [args...], write <file> <text>,
 # echo <text>, ps, clear,
-# uptime, sync, pid, help, exit.
+# uptime, sync, pid, panic, help, exit.
 # No pipes, no scripting -- just enough to poke around from a prompt.
 
 .intel_syntax noprefix
@@ -46,7 +47,7 @@ msg_banner:   .ascii "EonOS shell -- type 'help' for commands\n"
 .equ msg_banner_len, . - msg_banner
 prompt:       .ascii "eonsh> "
 .equ prompt_len, . - prompt
-msg_help:     .ascii "commands: ls, lsblk -f, cat, exec, write, mkdir, rm, touch, cp, edit, echo, ps, clear, uptime, sync, pid, help, exit\n"
+msg_help:     .ascii "commands: ls, lsblk, mount <device> <dir>, cat, exec, write, mkdir, rm, touch, cp, edit, echo, ps, clear, uptime, sync, pid, panic, help, exit\n"
 .equ msg_help_len, . - msg_help
 msg_unknown:  .ascii "unknown command: "
 .equ msg_unknown_len, . - msg_unknown
@@ -56,7 +57,7 @@ msg_exec_error: .ascii "exec: unable to launch file\n"
 .equ msg_exec_error_len, . - msg_exec_error
 msg_sync_ok: .ascii "sync: storage reports durable writes\n"
 .equ msg_sync_ok_len, . - msg_sync_ok
-msg_sync_volatile: .ascii "sync: backing storage is volatile; changes remain in RAM\n"
+msg_sync_volatile: .ascii "sync: no writable filesystem is mounted\n"
 .equ msg_sync_volatile_len, . - msg_sync_volatile
 msg_sync_error: .ascii "sync: storage commit failed\n"
 .equ msg_sync_error_len, . - msg_sync_error
@@ -66,7 +67,7 @@ msg_lsblk_error: .ascii "lsblk: unable to list block devices\n"
 .equ msg_lsblk_error_len, . - msg_lsblk_error
 msg_write_ok: .ascii "write: saved\n"
 .equ msg_write_ok_len, . - msg_write_ok
-msg_write_error: .ascii "write: failed (use a valid FAT32 path under /disk)\n"
+msg_write_error: .ascii "write: failed (mount a FAT32 disk at /disk first)\n"
 .equ msg_write_error_len, . - msg_write_error
 msg_toobig:   .ascii "cat: file too large to display\n"
 .equ msg_toobig_len, . - msg_toobig
@@ -76,6 +77,10 @@ msg_rm_error: .ascii "rm: failed\n"
 .equ msg_rm_error_len, . - msg_rm_error
 msg_touch_error: .ascii "touch: failed\n"
 .equ msg_touch_error_len, . - msg_touch_error
+msg_mount_ok: .ascii "mount: mounted\n"
+.equ msg_mount_ok_len, . - msg_mount_ok
+msg_mount_error: .ascii "mount: failed (use /device/<disk> and a FAT32 filesystem)\n"
+.equ msg_mount_error_len, . - msg_mount_error
 msg_edit_header: .ascii " EonOS nano -- append lines, .save writes, .quit exits\n"
 .equ msg_edit_header_len, . - msg_edit_header
 msg_edit_prompt: .ascii "nano> "
@@ -91,12 +96,13 @@ clear_seq:    .ascii "\x1b[2J\x1b[H"    # CSI 2J (clear) + CSI H (home)
 .equ clear_seq_len, . - clear_seq
 cmd_ls:       .ascii "ls"
 cmd_lsblk:    .ascii "lsblk"
-cmd_lsblk_f:  .ascii "lsblk -f"
+cmd_mount:    .ascii "mount "
 cmd_help:     .ascii "help"
 cmd_exit:     .ascii "exit"
 cmd_clear:    .ascii "clear"
 cmd_uptime:   .ascii "uptime"
 cmd_pid:      .ascii "pid"
+cmd_panic:    .ascii "panic"
 cmd_ps:       .ascii "ps"
 cmd_cat:      .ascii "cat "   # note trailing space: "cat" alone is not this
 cmd_exec:     .ascii "exec "
@@ -153,25 +159,27 @@ _start:
     jmp  .Lloop
 
 .Ltry_lsblk:
-    cmp  rcx, 8
-    je   .Ltry_lsblk_f
     cmp  rcx, 5
-    jne  .Ltry_help
+    jne  .Ltry_mount
     lea  rdi, [rip + cmd_lsblk]
+    lea  rsi, [rip + line_buf]
     mov  r8, rcx
     call streq
     test rax, rax
-    jz   .Ltry_help
+    jz   .Ltry_mount
     call do_lsblk
     jmp  .Lloop
 
-.Ltry_lsblk_f:
-    lea  rdi, [rip + cmd_lsblk_f]
-    mov  r8, rcx
-    call streq
+.Ltry_mount:
+    cmp  rcx, 7
+    jle  .Ltry_help
+    lea  rdi, [rip + cmd_mount]
+    lea  rsi, [rip + line_buf]
+    mov  r8, 6
+    call strprefix
     test rax, rax
     jz   .Ltry_help
-    call do_lsblk
+    call do_mount
     jmp  .Lloop
 
 .Ltry_help:
@@ -181,7 +189,7 @@ _start:
     mov  r8, rcx
     call streq
     test rax, rax
-    jz   .Ltry_exit
+    jz   .Ltry_sync
     lea  rsi, [rip + msg_help]
     mov  edx, msg_help_len
     call print
@@ -189,12 +197,12 @@ _start:
 
 .Ltry_sync:
     cmp  rcx, 4
-    jne  .Ltry_exit
+    jne  .Ltry_panic
     lea  rdi, [rip + cmd_sync]
     mov  r8, rcx
     call streq
     test rax, rax
-    jz   .Ltry_exit
+    jz   .Ltry_panic
     mov  eax, 9009                      # sync / commit request
     syscall
     test rax, rax
@@ -213,6 +221,18 @@ _start:
     mov  edx, msg_sync_error_len
     call print
     jmp  .Lloop
+
+.Ltry_panic:
+    cmp  rcx, 5
+    jne  .Ltry_exit
+    lea  rdi, [rip + cmd_panic]
+    mov  r8, rcx
+    call streq
+    test rax, rax
+    jz   .Ltry_exit
+    mov  eax, 9011                      # request an intentional kernel panic
+    syscall
+    jmp  .Lloop                          # syscall is expected not to return
 
 .Ltry_exit:
     cmp  rcx, 4
@@ -579,11 +599,14 @@ _start:
     jmp  .Lloop
 
 .Lunknown:
+    # The syscall instruction clobbers RCX, so preserve the command
+    # length before printing the prefix and reuse it for the command.
+    push rcx
     lea  rsi, [rip + msg_unknown]
     mov  edx, msg_unknown_len
     call print
+    pop  rdx
     lea  rsi, [rip + line_buf]
-    mov  rdx, rcx
     call print
     lea  rsi, [rip + newline]
     mov  edx, 1
@@ -637,6 +660,52 @@ do_lsblk:
     call print
     pop  rbx
     ret
+
+# ---------------------------------------------------------------------
+# do_mount: mount a block device from /device at a VFS directory.
+# ---------------------------------------------------------------------
+do_mount:
+    push rbx
+    push r12
+    push r13
+    push r14
+    lea  r12, [rip + line_buf + 6]
+    mov  r13, rcx
+    sub  r13, 6                         # command tail length
+    xor  r14d, r14d                     # separator index
+.Lmount_find_separator:
+    cmp  r14, r13
+    jae  .Lmount_error
+    cmp  byte ptr [r12 + r14], ' '
+    je   .Lmount_separator_found
+    inc  r14
+    jmp  .Lmount_find_separator
+.Lmount_separator_found:
+    test r14, r14
+    jz   .Lmount_error
+    lea  rbx, [r12 + r14 + 1]           # mountpoint string
+    mov  byte ptr [r12 + r14], 0        # terminate /device/... string
+    mov  rdi, r12
+    mov  rsi, rbx
+    mov  eax, 9012                      # mount(device, mountpoint)
+    syscall
+    test rax, rax
+    js   .Lmount_error
+    lea  rsi, [rip + msg_mount_ok]
+    mov  edx, msg_mount_ok_len
+    call print
+    jmp  .Lmount_return
+.Lmount_error:
+    lea  rsi, [rip + msg_mount_error]
+    mov  edx, msg_mount_error_len
+    call print
+.Lmount_return:
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    ret
+
 1:  pop  rbx
     ret
 

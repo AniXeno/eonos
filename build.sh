@@ -15,7 +15,11 @@ for arg in "$@"; do
     esac
 done
 
-BUILD_DIR="$ROOT/build"
+BUILD_DIR="${EONOS_BUILD_DIR:-$ROOT/build}"
+if [ -z "$BUILD_DIR" ] || [ "$BUILD_DIR" = "/" ] || [ "$BUILD_DIR" = "$ROOT" ]; then
+    echo "Refusing unsafe build directory: '$BUILD_DIR'" >&2
+    exit 2
+fi
 ISO_ROOT="$BUILD_DIR/iso_root"
 ISO_OUTPUT="$BUILD_DIR/iso_output"
 
@@ -34,8 +38,9 @@ ISO_PATH="$ISO_OUTPUT/$ISO_NAME"
 
 TARGET_DIR="$ROOT/target/x86_64-eonos"
 
-echo "==> Cleaning build directory"
-rm -rf "$BUILD_DIR"
+echo "==> Cleaning generated build artifacts (preserving eonos_disk.img)"
+rm -rf "$ISO_ROOT" "$ISO_OUTPUT" "$INITRAMFS_ROOT"
+rm -f "$BUILD_DIR/fat32.img"
 mkdir -p "$BUILD_DIR" "$ISO_OUTPUT"
 
 echo "==> Building kernel (profile: $PROFILE)"
@@ -82,18 +87,36 @@ ld -static -nostdlib \
     -o "$BUILD_DIR/hello.elf" \
     "$BUILD_DIR/hello.o"
 
-echo "==> Creating FAT32 data volume"
+echo "==> Creating persistent FAT32 disk image"
 for tool in mkfs.fat mcopy; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Required tool '$tool' is missing (install dosfstools and mtools)" >&2
         exit 1
     fi
 done
-FAT32_IMAGE="$BUILD_DIR/fat32.img"
-truncate -s 64M "$FAT32_IMAGE"
-mkfs.fat -F 32 -n EONOS "$FAT32_IMAGE" >/dev/null
-mcopy -i "$FAT32_IMAGE" "$BUILD_DIR/hello.elf" ::/HELLO.ELF
-mcopy -i "$FAT32_IMAGE" "$ROOT/README.md" ::/README.TXT
+DISK_IMAGE="$BUILD_DIR/eonos_disk.img"
+MAX_DISK_BYTES=$((4 * 1024 * 1024 * 1024))
+if [ ! -e "$DISK_IMAGE" ]; then
+    DISK_IMAGE_TMP="$DISK_IMAGE.new"
+    rm -f "$DISK_IMAGE_TMP"
+    truncate -s "$MAX_DISK_BYTES" "$DISK_IMAGE_TMP"
+    mkfs.fat -F 32 -n EONOS_DATA "$DISK_IMAGE_TMP" >/dev/null
+    mcopy -i "$DISK_IMAGE_TMP" "$BUILD_DIR/hello.elf" ::/HELLO.ELF
+    mcopy -i "$DISK_IMAGE_TMP" "$ROOT/README.md" ::/README.TXT
+    mv "$DISK_IMAGE_TMP" "$DISK_IMAGE"
+elif [ ! -f "$DISK_IMAGE" ]; then
+    echo "Disk image path exists but is not a regular file: $DISK_IMAGE" >&2
+    exit 1
+fi
+DISK_BYTES=$(stat -c %s "$DISK_IMAGE")
+if [ "$DISK_BYTES" -gt "$MAX_DISK_BYTES" ]; then
+    echo "Disk image exceeds the 4 GiB maximum: $DISK_IMAGE ($DISK_BYTES bytes)" >&2
+    exit 1
+fi
+if [ "$DISK_BYTES" -lt 512 ]; then
+    echo "Disk image is too small to contain a filesystem: $DISK_IMAGE" >&2
+    exit 1
+fi
 
 echo "==> Packing initramfs"
 
@@ -136,8 +159,6 @@ cp "$ROOT/limine.conf" \
 
 cp "$BUILD_DIR/$INITRAMFS_NAME" \
     "$ISO_ROOT/boot/$INITRAMFS_NAME"
-
-cp "$FAT32_IMAGE" "$ISO_ROOT/boot/fat32.img"
 
 cp \
     "$LIMINE_DIR/limine-bios.sys" \

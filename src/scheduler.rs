@@ -170,8 +170,7 @@ fn slot_base(slot: usize) -> u64 {
 fn unmap_stack(base: u64, pages: u64) {
     for i in 0..pages {
         let virt = base + (1 + i) * PAGE_SIZE;
-        if let Some(phys) = vmm::translate(virt) {
-            vmm::unmap_page(virt);
+        if let Some(phys) = vmm::unmap_page(virt) {
             pmm::free_frame(phys);
         }
     }

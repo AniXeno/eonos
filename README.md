@@ -22,11 +22,22 @@ Use `./runb.sh` for a normal build, which suppresses `DEBUG` log lines and
 creates `build/iso_output/eonos.iso`. Use `./runb.sh --debug` to include
 `DEBUG` logs and create `build/iso_output/eonos_debugbuild.iso`.
 
-The initramfs is mounted as `/`. The build also includes a FAT32 image
-mounted at `/disk`. FAT32 supports short and long names, file writes, directory
-creation, and removal. `lsblk -f` lists detected disks and partitions with
-filesystem labels and UUIDs where available. Shell commands include `mkdir`, `rm`, `touch`, `cp`,
-and `write`; for example, `mkdir /disk/notes` followed by
+Run `python3 tests/qemu_smoke.py` for a headless QEMU smoke test. It builds
+into a temporary directory, checks boot and shell behavior, then rebuilds and
+reboots with the same disk image to verify file persistence. It triggers the
+`panic` command last to verify the kernel panic path. Prerequisites are QEMU,
+the Rust nightly toolchain, GNU binutils, `dosfstools`,
+`mtools`, and `xorriso`.
+
+The initramfs is mounted as `/`. The build creates a persistent, sparse 4 GiB
+FAT32 image at `build/eonos_disk.img` and attaches it to QEMU as an NVMe disk.
+The image is preserved across builds; files written to it survive guest
+reboots. The disk starts unmounted so writes require an explicit mount, for
+example `mount /device/nvme0n1 /disk`. `/device/...` is the device namespace
+used by EonOS for devices such as `/device/console`. `lsblk` lists detected
+disks and filesystems, including their mountpoints. FAT32 supports short and
+long names, file writes, directory creation, and removal. Shell commands include
+`mkdir`, `rm`, `touch`, `cp`, and `write`; for example, `mkdir /disk/notes` followed by
 `write /disk/notes/todo.txt remember`. `edit /disk/notes/todo.txt` opens a
 small line-oriented editor: enter lines to append, `.save` to write, or
 `.quit` to leave. `cp source destination` copies files in 4 KiB chunks.
@@ -42,14 +53,12 @@ Opened files use per-process descriptors with sequential reads and writes;
 `open` supports read-only, write-only, read/write, create, truncate, and append
 modes.
 
-Changes live in a sparse RAM overlay and are lost when the machine reboots.
-The shell's `sync` command asks mounted storage to commit pending writes. The
-boot image has no writable backing device, so it reports that changes remain
-volatile; a device with durable flush support can implement the same interface.
-The initramfs remains read-only. Use `ls`, `cat /disk/README.TXT`, or
-`exec /disk/HELLO.ELF` to access the bundled files.
+The shell's `sync` command flushes mounted storage to the backing disk. FAT32
+mutations also issue a device flush before reporting success. The root
+initramfs remains read-only. After mounting the disk, `ls` shows `/disk` in the
+root listing; use `cat /disk/README.TXT` or `exec /disk/HELLO.ELF` to access
+the bundled files.
 
-The kernel probes AHCI/SATA and NVMe controllers for read-only block access.
-Under QEMU, attach an optional raw disk as a virtual NVMe device with
-`EONOS_NVME_DISK=/path/to/disk.img ./run.sh`. QEMU opens it read-only, and
-EonOS's current physical-disk drivers do not issue writes.
+The kernel probes AHCI/SATA and NVMe controllers for block access. NVMe
+devices support writes; AHCI/SATA remains read-only. To use a different raw
+NVMe disk image in QEMU, set `EONOS_NVME_DISK=/path/to/disk.img ./run.sh`.

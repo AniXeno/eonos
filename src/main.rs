@@ -79,6 +79,7 @@ unsafe extern "C" fn _start() -> ! {
     framebuffer::bench("post-VMM, write-combining");
 
     heap::init();
+    drivers::virtio_gpu::init();
     // Console shadow storage uses the kernel heap. Bring the console up
     // after VMM/heap so rendering and scrollback never read from WC memory.
     console::init();
@@ -127,9 +128,11 @@ unsafe extern "C" fn _start() -> ! {
     initramfs::init();
     initramfs::self_test();
     vfs::init();
-    fat32::mount_boot_volume();
 
     process::self_test();
+    if scheduler::spawn("usb-service", drivers::usb::xhci::service).is_none() {
+        log_fail!("USB", "Service", "Could not start USB polling worker");
+    }
     process::start_init();
 
     log_ok!("Kernel", "Init", "Initialization complete, handing over to the scheduler");

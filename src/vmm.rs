@@ -180,6 +180,34 @@ unsafe fn split_huge(pd: *mut Table, idx: usize) {
     (*pd).0[idx] = phys | PRESENT | WRITABLE | USER;
 }
 
+/// Replace a 1 GiB mapping with 512 equivalent 2 MiB mappings before
+/// descending into its page directory.
+unsafe fn split_1g_huge(pdpt: *mut Table, idx: usize) {
+    let entry = (*pdpt).0[idx];
+    let base = entry & HUGE_1G_MASK;
+    let mut flags = entry & !ADDR_MASK & !HUGE;
+    if entry & PAT_HUGE != 0 {
+        flags |= PAT_HUGE;
+    }
+
+    let phys = pmm::alloc_frame_zeroed().expect("VMM: out of memory splitting a 1 GiB page");
+    let pd = table_ptr(phys);
+    for i in 0..ENTRIES {
+        (*pd).0[i] = (base + i as u64 * HUGE_2M) | flags | PRESENT | HUGE;
+    }
+    (*pdpt).0[idx] = phys | PRESENT | WRITABLE | USER;
+}
+
+unsafe fn pd_for(pdpt: *mut Table, virt: u64) -> *mut Table {
+    let idx = index(virt, 1);
+    let entry = (*pdpt).0[idx];
+    if entry & PRESENT != 0 && entry & HUGE != 0 {
+        split_1g_huge(pdpt, idx);
+        invlpg(virt);
+    }
+    child_table(pdpt, idx)
+}
+
 /// The page table covering `virt`, splitting a 2 MiB page first if that's
 /// what currently maps it. Without this, a 4K mapping inside a huge page
 /// would treat the huge page's memory as a page table and scribble on it.
@@ -193,9 +221,44 @@ unsafe fn pt_for(pd: *mut Table, virt: u64) -> *mut Table {
     child_table(pd, idx)
 }
 
+/// Find a mapped 4 KiB leaf, splitting any covering huge mapping so the
+/// caller can change just this page. Does not allocate tables for absent
+/// mappings.
+unsafe fn leaf_for(pml4: *mut Table, virt: u64) -> Option<*mut u64> {
+    let pml4_entry = (*pml4).0[index(virt, 0)];
+    if pml4_entry & PRESENT == 0 || pml4_entry & HUGE != 0 {
+        return None;
+    }
+    let pdpt = table_ptr(pml4_entry & ADDR_MASK);
+    let pdpt_idx = index(virt, 1);
+    let mut entry = (*pdpt).0[pdpt_idx];
+    if entry & PRESENT == 0 {
+        return None;
+    }
+    if entry & HUGE != 0 {
+        split_1g_huge(pdpt, pdpt_idx);
+        invlpg(virt);
+        entry = (*pdpt).0[pdpt_idx];
+    }
+    let pd = table_ptr(entry & ADDR_MASK);
+    let pd_idx = index(virt, 2);
+    entry = (*pd).0[pd_idx];
+    if entry & PRESENT == 0 {
+        return None;
+    }
+    if entry & HUGE != 0 {
+        split_huge(pd, pd_idx);
+        invlpg(virt);
+        entry = (*pd).0[pd_idx];
+    }
+    let pt = table_ptr(entry & ADDR_MASK);
+    let leaf = core::ptr::addr_of_mut!((*pt).0[index(virt, 3)]);
+    if *leaf & PRESENT == 0 { None } else { Some(leaf) }
+}
+
 unsafe fn map4k(pml4: *mut Table, virt: u64, phys: u64, flags: u64) {
     let pdpt = child_table(pml4, index(virt, 0));
-    let pd = child_table(pdpt, index(virt, 1));
+    let pd = pd_for(pdpt, virt);
     let pt = pt_for(pd, virt);
     (*pt).0[index(virt, 3)] = (phys & ADDR_MASK) | flags | PRESENT;
 }
@@ -260,34 +323,35 @@ pub fn map_mmio(phys: u64, len: u64) -> *mut u8 {
     (hhdm + phys) as *mut u8
 }
 
-pub fn unmap_page(virt: u64) {
+/// Remove one 4 KiB mapping and return its physical frame, if mapped.
+/// The caller retains responsibility for freeing or reusing that frame.
+pub fn unmap_page(virt: u64) -> Option<u64> {
     let guard = VMM.lock();
-    let Some(vmm) = guard.as_ref() else { return };
+    let Some(vmm) = guard.as_ref() else { return None };
     unsafe {
         let pml4 = table_ptr(vmm.pml4_phys);
-        let e = (*pml4).0[index(virt, 0)];
-        if e & PRESENT == 0 {
-            return;
-        }
-        let pdpt = table_ptr(e & ADDR_MASK);
-        let e = (*pdpt).0[index(virt, 1)];
-        if e & PRESENT == 0 || e & HUGE != 0 {
-            return;
-        }
-        let pd = table_ptr(e & ADDR_MASK);
-        let idx = index(virt, 2);
-        let e = (*pd).0[idx];
-        if e & PRESENT == 0 {
-            return;
-        }
-        if e & HUGE != 0 {
-            split_huge(pd, idx);
-        }
-        let e = (*pd).0[idx];
-        let pt = table_ptr(e & ADDR_MASK);
-        (*pt).0[index(virt, 3)] = 0;
+        let leaf = leaf_for(pml4, virt)?;
+        let phys = *leaf & ADDR_MASK;
+        *leaf = 0;
+        invlpg(virt);
+        Some(phys)
+    }
+}
+
+/// Change permissions and cache attributes on one kernel 4 KiB mapping.
+/// Huge mappings are split so neighboring pages keep their existing flags.
+pub fn protect_page(virt: u64, flags: u64) -> bool {
+    if !matches!(flags, KERNEL_RX | KERNEL_RO | KERNEL_RW | KERNEL_WC | KERNEL_UC) {
+        return false;
+    }
+    let guard = VMM.lock();
+    let Some(vmm) = guard.as_ref() else { return false };
+    unsafe {
+        let Some(leaf) = leaf_for(table_ptr(vmm.pml4_phys), virt) else { return false };
+        *leaf = (*leaf & ADDR_MASK) | flags | PRESENT;
         invlpg(virt);
     }
+    true
 }
 
 /// Software page-table walk. Handles 1 GiB, 2 MiB and 4 KiB mappings.
@@ -629,6 +693,39 @@ impl AddressSpace {
         }
     }
 
+    /// Remove one 4 KiB user mapping and return its physical frame. The
+    /// caller retains ownership of the frame and may free or reuse it.
+    pub fn unmap(&self, virt: u64) -> Option<u64> {
+        assert!(virt < USER_SPACE_END, "user unmap outside user address space");
+        let leaf = unsafe { leaf_for(table_ptr(self.pml4_phys), virt)? };
+        let phys = unsafe {
+            let phys = *leaf & ADDR_MASK;
+            *leaf = 0;
+            phys
+        };
+        unsafe { invlpg(virt) };
+        Some(phys)
+    }
+
+    /// Change permissions on one mapped user page. Returns false for an
+    /// absent page or an unsupported flag combination. Huge mappings are
+    /// split first so this affects only the requested 4 KiB page.
+    pub fn protect(&self, virt: u64, flags: u64) -> bool {
+        if virt >= USER_SPACE_END || !matches!(flags, USER_RX | USER_RO | USER_RW) {
+            return false;
+        }
+        let Some(leaf) = (unsafe { leaf_for(table_ptr(self.pml4_phys), virt) }) else {
+            return false;
+        };
+        unsafe {
+            *leaf = (*leaf & ADDR_MASK) | flags | PRESENT;
+            // INVLPG affects only the currently active CR3; harmless
+            // when this address space is inactive.
+            invlpg(virt);
+        }
+        true
+    }
+
     /// Software page-table walk in this address space, independent of
     /// which address space is currently active in CR3.
     pub fn translate(&self, virt: u64) -> Option<u64> {
@@ -900,15 +997,20 @@ pub fn self_test() {
         read_back == 0xCAFE_F00D_1234_5678 && translate(SELF_TEST_VIRT) == Some(phys)
     };
 
-    unmap_page(SELF_TEST_VIRT);
-    pmm::free_frame(phys);
+    let protect_ok = protect_page(SELF_TEST_VIRT, KERNEL_RO)
+        && translate(SELF_TEST_VIRT) == Some(phys)
+        && protect_page(SELF_TEST_VIRT, KERNEL_RW);
+    let unmapped = unmap_page(SELF_TEST_VIRT);
+    if let Some(frame) = unmapped {
+        pmm::free_frame(frame);
+    }
 
-    if translate(SELF_TEST_VIRT).is_some() {
+    if translate(SELF_TEST_VIRT).is_some() || unmapped != Some(phys) {
         log_fail!("VMM", "SelfTest", "Page survived unmap at {:#x}", SELF_TEST_VIRT);
         return;
     }
 
-    if ok {
+    if ok && protect_ok {
         log_ok!(
             "VMM",
             "SelfTest",
@@ -1011,6 +1113,12 @@ pub fn address_space_self_test() {
         ptr.read_volatile() == 0xA11C_0A11_C0DE_5A5A
     };
 
+    let protect_ro_ok = aspace.protect(SELF_TEST_USER_VIRT, USER_RX)
+        && unsafe { walk_user(aspace.pml4_phys, SELF_TEST_USER_VIRT).is_some() }
+        && unsafe { walk_user_write(aspace.pml4_phys, SELF_TEST_USER_VIRT).is_none() };
+    let protect_rw_ok = aspace.protect(SELF_TEST_USER_VIRT, USER_RW)
+        && unsafe { walk_user_write(aspace.pml4_phys, SELF_TEST_USER_VIRT).is_some() };
+
     // Switch back before touching anything else: kernel code and data
     // must be exactly as usable as before, since it never actually
     // moved -- only the private half changed underneath it.
@@ -1032,9 +1140,33 @@ pub fn address_space_self_test() {
         return;
     }
 
-    // Dropping tears down the private half -- including the page tables
-    // `map` just allocated and the data frame itself -- without going
-    // anywhere near the shared kernel half.
+    if !protect_ro_ok || !protect_rw_ok {
+        log_fail!(
+            "VMM",
+            "AddressSpaceSelfTest",
+            "Protect did not update user page permissions as requested"
+        );
+        return;
+    }
+
+    let unmapped = aspace.unmap(SELF_TEST_USER_VIRT);
+    let unmap_ok = unmapped == Some(user_phys)
+        && aspace.translate(SELF_TEST_USER_VIRT).is_none();
+    if let Some(phys) = unmapped {
+        pmm::free_frame(phys);
+    }
+    if !unmap_ok {
+        log_fail!(
+            "VMM",
+            "AddressSpaceSelfTest",
+            "Unmap did not return the removed frame and clear the mapping"
+        );
+        return;
+    }
+
+    // Dropping tears down the private page tables without going anywhere
+    // near the shared kernel half. The unmapped data frame was returned
+    // above and freed by this test.
     drop(aspace);
 
     let frames_after = pmm::free_frame_count();

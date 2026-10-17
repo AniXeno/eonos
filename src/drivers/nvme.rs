@@ -1,5 +1,5 @@
 //! Minimal polling NVMe PCI driver, restricted to 512-byte logical blocks.
-//! Writes are intentionally not exposed yet.
+//! Sector writes and namespace flushes back persistent FAT32 volumes.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -46,6 +46,8 @@ struct NvmeDisk{shared:Arc<Shared>,nsid:u32,capacity:u64}
 impl BlockDevice for NvmeDisk{
  fn sector_count(&self)->u64{self.capacity}
  fn read_sector(&self,lba:u64,out:&mut[u8;SECTOR_SIZE])->Result<(),BlockError>{if lba>=self.capacity{return Err(BlockError::OutOfRange)}let mut q=self.shared.queue.lock();let data=&self.shared.data;let e=Entry{opcode:2,nsid:self.nsid,prp1:data.phys,cdw:[lba as u32,(lba>>32)as u32,0,0,0,0],..Entry::default()};q.submit(e).ok_or(BlockError::BadBuffer)?;out.copy_from_slice(unsafe{&(&(*data.ptr).0)[..512]});Ok(())}
+ fn write_sector(&self,lba:u64,data_in:&[u8;SECTOR_SIZE])->Result<(),BlockError>{if lba>=self.capacity{return Err(BlockError::OutOfRange)}let mut q=self.shared.queue.lock();let data=&self.shared.data;unsafe{(&mut(*data.ptr).0)[..SECTOR_SIZE].copy_from_slice(data_in)};let e=Entry{opcode:1,nsid:self.nsid,prp1:data.phys,cdw:[lba as u32,(lba>>32)as u32,0,0,0,0],..Entry::default()};q.submit(e).ok_or(BlockError::BadBuffer)?;Ok(())}
+ fn flush(&self)->Result<(),BlockError>{let mut q=self.shared.queue.lock();let e=Entry{opcode:0,nsid:self.nsid,..Entry::default()};q.submit(e).map(|_|()).ok_or(BlockError::BadBuffer)}
 }
 fn wait_ready(reg:*mut u32,want:bool)->bool{let start=crate::pit::uptime_ms();loop{let v=unsafe{core::ptr::read_volatile(reg)}&1!=0;if v==want{return true}if crate::pit::uptime_ms().saturating_sub(start)>TIMEOUT_MS{return false}core::hint::spin_loop()}}
 fn controller(base:u64)->Option<(Arc<Shared>,alloc::vec::Vec<(u32,u64)>)>{

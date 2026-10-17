@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-BUILD_DIR="$ROOT/build"
+BUILD_DIR="${EONOS_BUILD_DIR:-$ROOT/build}"
 DEBUG_BUILD=0
 if [ "${1:-}" = "--debug" ]; then
     DEBUG_BUILD=1
@@ -18,6 +18,12 @@ if [ "$DEBUG_BUILD" = "1" ]; then
     ISO_PATH="$BUILD_DIR/iso_output/eonos_debugbuild.iso"
 else
     ISO_PATH="$BUILD_DIR/iso_output/eonos.iso"
+fi
+
+if [ -n "${EONOS_NVME_DISK:-}" ]; then
+    DISK_PATH="$EONOS_NVME_DISK"
+else
+    DISK_PATH="$BUILD_DIR/eonos_disk.img"
 fi
 
 UEFI="${UEFI:-1}"
@@ -35,6 +41,9 @@ else
             break
         fi
     done
+fi
+if [ -z "${EONOS_NVME_DISK:-}" ] && [ ! -f "$DISK_PATH" ]; then
+    NEEDS_BUILD=1
 fi
 
 if [ "$NEEDS_BUILD" = "1" ]; then
@@ -85,13 +94,13 @@ if [ "$UEFI" = "1" ]; then
     )
 fi
 
-# Optional raw NVMe passthrough for lsblk development. Keep this read-only:
-# the current EonOS storage drivers intentionally do not issue disk writes.
-if [ -n "${EONOS_NVME_DISK:-}" ]; then
-    ARGS+=(
-        -drive "file=$EONOS_NVME_DISK,format=raw,if=none,id=eonos_nvme,readonly=on,aio=threads,file.locking=off"
-        -device nvme,drive=eonos_nvme,serial=EONOSNVME0001
-    )
+if [ ! -f "$DISK_PATH" ]; then
+    echo "NVMe disk image not found: $DISK_PATH" >&2
+    exit 1
 fi
+ARGS+=(
+    -drive "file=$DISK_PATH,format=raw,if=none,id=eonos_nvme"
+    -device nvme,drive=eonos_nvme,serial=EONOSNVME0001
+)
 
 exec qemu-system-x86_64 "${ARGS[@]}"

@@ -96,7 +96,9 @@ impl Logger {
         }
 
         if let Some(console) = CONSOLE.lock().as_mut() {
+            console.begin_batch();
             emit(console, true, module, function, output, status);
+            console.end_batch();
         } else if self.early_count < EARLY_LOG_CAPACITY {
             let entry = &mut self.early_buffer[self.early_count];
             let mut writer = BufferWriter { buf: &mut entry.buf, len: 0 };
@@ -108,6 +110,7 @@ impl Logger {
 
     fn flush(&mut self) {
         if let Some(console) = CONSOLE.lock().as_mut() {
+            console.begin_batch();
             for i in 0..self.early_count {
                 let entry = &self.early_buffer[i];
                 if let Ok(s) = core::str::from_utf8(&entry.buf[..entry.len]) {
@@ -115,6 +118,7 @@ impl Logger {
                     let _ = console.write_str("\x1b[0m");
                 }
             }
+            console.end_batch();
             self.early_count = 0;
         }
     }

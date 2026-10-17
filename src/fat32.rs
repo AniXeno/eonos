@@ -7,8 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::block::{BlockDevice, MemoryBlockDevice};
-use crate::{log_fail, log_ok};
+use crate::block::BlockDevice;
 
 pub const SECTOR_SIZE: usize = 512;
 const MAX_CHAIN_STEPS: u32 = 1_000_000;
@@ -886,37 +885,6 @@ impl Fat32 {
             return Err(error);
         }
         Ok(data.len())
-    }
-}
-
-/// Mount the FAT32 boot image at `/disk`, if Limine loaded it.
-pub fn mount_boot_volume() {
-    let Some(bytes) = crate::initramfs::module_bytes("fat32.img") else {
-        log_fail!(
-            "FAT32",
-            "Mount",
-            "fat32.img boot module is missing or unmapped"
-        );
-        return;
-    };
-    let Some(device) = MemoryBlockDevice::new(bytes) else {
-        log_fail!(
-            "FAT32",
-            "Mount",
-            "fat32.img size is not a multiple of 512 bytes"
-        );
-        return;
-    };
-    let device: &'static dyn BlockDevice = alloc::boxed::Box::leak(alloc::boxed::Box::new(device));
-    crate::block::register_device("ram0", device);
-    match crate::vfs::mount_fat32("/disk", device) {
-        Ok(()) => log_ok!(
-            "FAT32",
-            "Mount",
-            "Writable RAM-overlay FAT32 volume mounted at /disk ({} sectors)",
-            device.sector_count()
-        ),
-        Err(e) => log_fail!("FAT32", "Mount", "Could not mount boot volume: {:?}", e),
     }
 }
 

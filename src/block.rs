@@ -24,6 +24,11 @@ pub fn register_device(name: &'static str, device: &'static dyn BlockDevice) {
 
 pub fn devices() -> Vec<RegisteredDevice> { DEVICES.lock().clone() }
 
+/// Look up a registered block device by its kernel-visible name.
+pub fn find_device(name: &str) -> Option<&'static dyn BlockDevice> {
+    DEVICES.lock().iter().find(|entry| entry.name == name).map(|entry| entry.device)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockError {
     OutOfRange,

@@ -32,6 +32,7 @@ enum Filesystem {
 struct Mount {
     prefix: String,
     fs: Filesystem,
+    source_device: Option<String>,
 }
 static MOUNTS: IrqMutex<Vec<Mount>> = IrqMutex::new(Vec::new());
 const MAX_READ_ALL: usize = 16 * 1024 * 1024;
@@ -86,25 +87,57 @@ pub fn init() {
     mounts.push(Mount {
         prefix: String::from("/"),
         fs: Filesystem::Initramfs,
+        source_device: None,
     });
 }
 
 /// Mount a FAT32 volume at an absolute path, e.g. `/disk`.
 pub fn mount_fat32(prefix: &str, device: &'static dyn BlockDevice) -> Result<(), FsError> {
+    mount_fat32_inner(prefix, None, device)
+}
+
+/// Mount a registered FAT32 device and retain its block-device name for lsblk.
+pub fn mount_fat32_device(
+    prefix: &str,
+    device_name: &str,
+    device: &'static dyn BlockDevice,
+) -> Result<(), FsError> {
+    mount_fat32_inner(prefix, Some(device_name), device)
+}
+
+fn mount_fat32_inner(
+    prefix: &str,
+    source_device: Option<&str>,
+    device: &'static dyn BlockDevice,
+) -> Result<(), FsError> {
+    if !prefix.starts_with('/') {
+        return Err(FsError::InvalidPath);
+    }
     let prefix = normalize(prefix)?;
     if prefix == "/" {
         return Err(FsError::InvalidPath);
     }
     let fs = Fat32::mount(device).map_err(|_| FsError::Io)?;
     let mut mounts = MOUNTS.lock();
-    if mounts.iter().any(|m| m.prefix == prefix) {
+    if mounts.iter().any(|mount| {
+        mount.prefix == prefix
+            || source_device.is_some_and(|device| mount.source_device.as_deref() == Some(device))
+    }) {
         return Err(FsError::InvalidPath);
     }
     mounts.push(Mount {
         prefix,
         fs: Filesystem::Fat32(fs),
+        source_device: source_device.map(String::from),
     });
     Ok(())
+}
+
+/// Return the mountpoint for a registered block device, if it is mounted.
+pub fn mountpoint_for_device(device_name: &str) -> Option<String> {
+    MOUNTS.lock().iter()
+        .find(|mount| mount.source_device.as_deref() == Some(device_name))
+        .map(|mount| mount.prefix.clone())
 }
 
 /// Mount a FAT32/vfat partition using partition-relative sector addresses.
@@ -156,7 +189,11 @@ pub fn create_file(path: &str) -> Result<(), FsError> {
     let (mount, inner) = route(&mounts, &path).ok_or(FsError::NotFound)?;
     match &mount.fs {
         Filesystem::Initramfs => Err(FsError::ReadOnly),
-        Filesystem::Fat32(fs) => fs.create_file(inner).map_err(map_fat_error),
+        Filesystem::Fat32(fs) => {
+            fs.create_file(inner).map_err(map_fat_error)?;
+            flush_filesystem(fs)?;
+            Ok(())
+        }
     }
 }
 
@@ -166,7 +203,11 @@ pub fn create_dir(path: &str) -> Result<(), FsError> {
     let (mount, inner) = route(&mounts, &path).ok_or(FsError::NotFound)?;
     match &mount.fs {
         Filesystem::Initramfs => Err(FsError::ReadOnly),
-        Filesystem::Fat32(fs) => fs.create_dir(inner).map_err(map_fat_error),
+        Filesystem::Fat32(fs) => {
+            fs.create_dir(inner).map_err(map_fat_error)?;
+            flush_filesystem(fs)?;
+            Ok(())
+        }
     }
 }
 
@@ -176,7 +217,11 @@ pub fn remove(path: &str) -> Result<(), FsError> {
     let (mount, inner) = route(&mounts, &path).ok_or(FsError::NotFound)?;
     match &mount.fs {
         Filesystem::Initramfs => Err(FsError::ReadOnly),
-        Filesystem::Fat32(fs) => fs.remove(inner).map_err(map_fat_error),
+        Filesystem::Fat32(fs) => {
+            fs.remove(inner).map_err(map_fat_error)?;
+            flush_filesystem(fs)?;
+            Ok(())
+        }
     }
 }
 
@@ -186,7 +231,11 @@ pub fn truncate(path: &str) -> Result<(), FsError> {
     let (mount, inner) = route(&mounts, &path).ok_or(FsError::NotFound)?;
     match &mount.fs {
         Filesystem::Initramfs => Err(FsError::ReadOnly),
-        Filesystem::Fat32(fs) => fs.truncate(inner).map_err(map_fat_error),
+        Filesystem::Fat32(fs) => {
+            fs.truncate(inner).map_err(map_fat_error)?;
+            flush_filesystem(fs)?;
+            Ok(())
+        }
     }
 }
 
@@ -196,7 +245,11 @@ pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError
     let (mount, inner) = route(&mounts, &path).ok_or(FsError::NotFound)?;
     match &mount.fs {
         Filesystem::Initramfs => Err(FsError::ReadOnly),
-        Filesystem::Fat32(fs) => fs.write_at(inner, offset, data).map_err(map_fat_error),
+        Filesystem::Fat32(fs) => {
+            let written = fs.write_at(inner, offset, data).map_err(map_fat_error)?;
+            flush_filesystem(fs)?;
+            Ok(written)
+        }
     }
 }
 
@@ -220,20 +273,23 @@ pub fn file_size(path: &str) -> Result<usize, FsError> {
 }
 
 /// Ask writable mounted filesystems to make pending writes durable.
-/// The default boot-image device keeps changes in RAM and reports ReadOnly.
 pub fn sync() -> Result<(), FsError> {
     let mounts = MOUNTS.lock();
     let mut found_writable_mount = false;
     for mount in mounts.iter() {
         if let Filesystem::Fat32(fs) = &mount.fs {
             found_writable_mount = true;
-            fs.flush().map_err(|e| match e {
-                crate::block::BlockError::ReadOnly => FsError::ReadOnly,
-                _ => FsError::Io,
-            })?;
+            flush_filesystem(fs)?;
         }
     }
     if found_writable_mount { Ok(()) } else { Err(FsError::ReadOnly) }
+}
+
+fn flush_filesystem(fs: &Fat32) -> Result<(), FsError> {
+    fs.flush().map_err(|error| match error {
+        crate::block::BlockError::ReadOnly => FsError::ReadOnly,
+        _ => FsError::Io,
+    })
 }
 
 pub fn list(path: &str) -> Result<Vec<DirEntry>, FsError> {

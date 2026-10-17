@@ -10,8 +10,9 @@
 //! explicitly asks for it) before any of that works at all.
 //!
 //! `init()` discovers PCI USB controllers and starts each xHCI
-//! controller for direct-attached HID boot keyboards. This remains a
-//! small polling driver: it has no hub, hot-plug, or non-xHCI support.
+//! controller for direct-attached HID boot keyboards. The xHCI worker
+//! polls root ports for hot-plug changes. External hubs and non-xHCI
+//! controllers are not supported yet.
 
 pub mod pci;
 pub mod xhci;
@@ -20,6 +21,7 @@ use crate::log_ok;
 
 /// Discover USB host controllers and initialize every xHCI controller.
 pub fn init() {
+    xhci::self_test();
     let controllers = pci::find_usb_controllers();
 
     if controllers.is_empty() {

@@ -29,6 +29,7 @@ struct Font {
     width: usize,
     height: usize,
     bytes_per_row: usize,
+    ascii_glyphs: [u16; 128],
 }
 
 impl Font {
@@ -60,6 +61,34 @@ impl Font {
             &data[end..end]
         };
 
+        // Resolve ASCII once at font load. PSF2 fonts commonly carry a
+        // Unicode table, and scanning hundreds of glyph records per input
+        // character is otherwise a significant console rendering cost.
+        let mut ascii_glyphs = [u16::MAX; 128];
+        if has_unicode_table {
+            let mut pos = 0;
+            for glyph_idx in 0..num_glyphs {
+                let Some(relative_end) = unicode_table[pos..].iter().position(|&b| b == 0xff) else { break };
+                let glyph_end = pos + relative_end;
+                let mut token_start = pos;
+                for token_end in pos..=glyph_end {
+                    if token_end == glyph_end || unicode_table[token_end] == 0xfe {
+                        if token_end == token_start + 1 {
+                            let codepoint = unicode_table[token_start] as usize;
+                            if codepoint < ascii_glyphs.len()
+                                && glyph_idx <= u16::MAX as usize
+                                && ascii_glyphs[codepoint] == u16::MAX
+                            {
+                                ascii_glyphs[codepoint] = glyph_idx as u16;
+                            }
+                        }
+                        token_start = token_end + 1;
+                    }
+                }
+                pos = glyph_end + 1;
+            }
+        }
+
         Some(Font {
             glyphs: &data[headersize..end],
             unicode_table,
@@ -68,12 +97,20 @@ impl Font {
             width,
             height,
             bytes_per_row,
+            ascii_glyphs,
         })
     }
 
     fn glyph(&self, ch: char) -> &'static [u8] {
-        let mut idx = ch as usize;
-        if !self.unicode_table.is_empty() {
+        let codepoint = ch as usize;
+        let mut idx = if codepoint < self.ascii_glyphs.len()
+            && self.ascii_glyphs[codepoint] != u16::MAX
+        {
+            self.ascii_glyphs[codepoint] as usize
+        } else {
+            codepoint
+        };
+        if codepoint >= self.ascii_glyphs.len() && !self.unicode_table.is_empty() {
             let mut encoded_buf = [0; 4];
             let encoded = ch.encode_utf8(&mut encoded_buf);
             let mut start = 0;
@@ -112,6 +149,8 @@ pub struct Console {
     height: usize,
     pitch: usize,
     bytes_per_pixel: usize,
+    dirty: Option<(usize, usize, usize, usize)>,
+    batch_depth: usize,
     font: Font,
     cols: usize,
     rows: usize,
@@ -143,6 +182,8 @@ impl Console {
             height,
             pitch,
             bytes_per_pixel: (fb.bpp as usize) / 8,
+            dirty: None,
+            batch_depth: 0,
             font,
             cols: width / font.width,
             rows: height / font.height,
@@ -159,34 +200,22 @@ impl Console {
         }
     }
 
-    fn put_pixel(&mut self, x: usize, y: usize, color: u32) {
-        if x >= self.width || y >= self.height {
+    fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
+        let x_end = x.saturating_add(w).min(self.width);
+        let y_end = y.saturating_add(h).min(self.height);
+        if x >= x_end || y >= y_end {
             return;
         }
-        let offset = y * self.pitch + x * self.bytes_per_pixel;
-        self.shadow[offset] = color as u8;
-        self.shadow[offset + 1] = (color >> 8) as u8;
-        self.shadow[offset + 2] = (color >> 16) as u8;
-        if self.bytes_per_pixel == 4 {
-            self.shadow[offset + 3] = (color >> 24) as u8;
-        }
-    }
-
-    fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
-        let x_end = (x + w).min(self.width);
-        let y_end = (y + h).min(self.height);
         let bpp = self.bytes_per_pixel;
+        let pixel = [color as u8, (color >> 8) as u8, (color >> 16) as u8, (color >> 24) as u8];
         for py in y..y_end {
             let start = py * self.pitch + x * bpp;
             let row = &mut self.shadow[start..start + (x_end - x) * bpp];
             if color == 0 {
                 row.fill(0);
             } else {
-                for pixel in row.chunks_exact_mut(bpp) {
-                    pixel[0] = color as u8;
-                    pixel[1] = (color >> 8) as u8;
-                    pixel[2] = (color >> 16) as u8;
-                    if bpp == 4 { pixel[3] = (color >> 24) as u8; }
+                for dst in row.chunks_exact_mut(bpp) {
+                    dst.copy_from_slice(&pixel[..bpp]);
                 }
             }
         }
@@ -198,9 +227,12 @@ impl Console {
     fn flush_rect(&self, x: usize, y: usize, w: usize, h: usize) {
         let x_end = x.saturating_add(w).min(self.width);
         let y_end = y.saturating_add(h).min(self.height);
+        if x >= x_end || y >= y_end {
+            return;
+        }
         let row_bytes = (x_end - x) * self.bytes_per_pixel;
-        for py in y..y_end {
-            let offset = py * self.pitch + x * self.bytes_per_pixel;
+        let mut offset = y * self.pitch + x * self.bytes_per_pixel;
+        for _ in y..y_end {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     self.shadow.as_ptr().add(offset),
@@ -208,6 +240,39 @@ impl Console {
                     row_bytes,
                 );
             }
+            offset += self.pitch;
+        }
+        crate::drivers::virtio_gpu::present_rect(x, y, x_end - x, y_end - y);
+    }
+
+    fn mark_dirty(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        let x_end = x.saturating_add(w).min(self.width);
+        let y_end = y.saturating_add(h).min(self.height);
+        if x >= x_end || y >= y_end { return; }
+        self.dirty = Some(match self.dirty {
+            Some((left, top, right, bottom)) => {
+                (left.min(x), top.min(y), right.max(x_end), bottom.max(y_end))
+            }
+            None => (x, y, x_end, y_end),
+        });
+    }
+
+    fn flush_pending(&mut self) {
+        if let Some((x, y, right, bottom)) = self.dirty.take() {
+            self.flush_rect(x, y, right - x, bottom - y);
+        }
+    }
+
+    /// Keep formatted log fragments in the shadow buffer and flush once
+    /// after the complete logical log message has been rendered.
+    pub fn begin_batch(&mut self) {
+        self.batch_depth += 1;
+    }
+
+    pub fn end_batch(&mut self) {
+        self.batch_depth = self.batch_depth.saturating_sub(1);
+        if self.batch_depth == 0 {
+            self.flush_pending();
         }
     }
 
@@ -218,7 +283,7 @@ impl Console {
     pub fn clear(&mut self) {
         let bg = self.bg;
         self.fill_rect(0, 0, self.width, self.height, bg);
-        self.flush_rect(0, 0, self.width, self.height);
+        self.mark_dirty(0, 0, self.width, self.height);
         self.cursor_col = 0;
         self.cursor_row = 0;
     }
@@ -230,14 +295,21 @@ impl Console {
         let ox = col * font.width;
         let oy = row * font.height;
 
+        let bpp = self.bytes_per_pixel;
+        let fg_bytes = [fg as u8, (fg >> 8) as u8, (fg >> 16) as u8, (fg >> 24) as u8];
+        let bg_bytes = [bg as u8, (bg >> 8) as u8, (bg >> 16) as u8, (bg >> 24) as u8];
+        let row_bytes = font.width * bpp;
+        let mut dst = oy * self.pitch + ox * bpp;
         for y in 0..font.height {
-            for x in 0..font.width {
-                let byte = glyph[y * font.bytes_per_row + x / 8];
-                let on = byte & (0x80 >> (x % 8)) != 0;
-                self.put_pixel(ox + x, oy + y, if on { fg } else { bg });
+            let glyph_row = &glyph[y * font.bytes_per_row..(y + 1) * font.bytes_per_row];
+            let row = &mut self.shadow[dst..dst + row_bytes];
+            for (x, pixel) in row.chunks_exact_mut(bpp).enumerate() {
+                let color = if glyph_row[x / 8] & (0x80 >> (x & 7)) != 0 { &fg_bytes } else { &bg_bytes };
+                pixel.copy_from_slice(&color[..bpp]);
             }
+            dst += self.pitch;
         }
-        self.flush_rect(ox, oy, font.width, font.height);
+        self.mark_dirty(ox, oy, font.width, font.height);
     }
 
     fn newline(&mut self) {
@@ -256,7 +328,7 @@ impl Console {
         let y = (self.rows - 1) * self.font.height;
         let h = self.font.height;
         self.fill_rect(0, y, self.width, h, DEFAULT_BG);
-        self.flush_rect(0, 0, self.width, text_bytes / self.pitch);
+        self.mark_dirty(0, 0, self.width, text_bytes / self.pitch);
     }
 
     fn put_printable(&mut self, c: char) {
@@ -442,6 +514,9 @@ impl fmt::Write for Console {
         for c in s.chars() {
             self.put_char(c);
         }
+        if self.batch_depth == 0 {
+            self.flush_pending();
+        }
         Ok(())
     }
 }
@@ -475,6 +550,7 @@ pub fn init() {
     }
 
     console.clear();
+    console.flush_pending();
 
     let (cols, rows) = (console.cols, console.rows);
 

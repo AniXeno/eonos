@@ -234,6 +234,11 @@ pub const SYS_MKDIR: u64 = 9007;
 pub const SYS_REMOVE: u64 = 9008;
 pub const SYS_SYNC: u64 = 9009;
 pub const SYS_LIST_BLOCK_DEVICES: u64 = 9010;
+/// Intentionally enter the kernel panic handler (exposed by the shell's
+/// `panic` command for testing the panic screen and logging path).
+pub const SYS_PANIC: u64 = 9011;
+/// Mount a FAT32 block device at a VFS path; arguments are NUL-terminated strings.
+pub const SYS_MOUNT: u64 = 9012;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FdKind {
@@ -279,6 +284,7 @@ const E2BIG: i64 = 7;
 const ENOMEM: i64 = 12;
 const ENOEXEC: i64 = 8;
 const EAGAIN: i64 = 11;
+const ENODEV: i64 = 19;
 
 const O_WRONLY: u64 = 1;
 const O_RDWR: u64 = 2;
@@ -851,6 +857,18 @@ fn sys_sync() -> u64 {
     match crate::vfs::sync() { Ok(()) => 0, Err(error) => fs_errno(error) }
 }
 
+fn sys_mount(device_ptr: u64, mountpoint_ptr: u64) -> u64 {
+    let device_path = match copy_user_string(device_ptr) { Ok(path) => path, Err(error) => return error };
+    let mountpoint = match copy_user_string(mountpoint_ptr) { Ok(path) => path, Err(error) => return error };
+    let Some(device_name) = device_path.strip_prefix("/device/") else { return errno(ENODEV) };
+    if device_name.is_empty() || device_name.contains('/') { return errno(ENODEV); }
+    let Some(device) = crate::block::find_device(device_name) else { return errno(ENODEV) };
+    match crate::vfs::mount_fat32_device(&mountpoint, device_name, device) {
+        Ok(()) => 0,
+        Err(error) => fs_errno(error),
+    }
+}
+
 fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
     const WNOHANG: u64 = 1;
     if options & !WNOHANG != 0 { return errno(EINVAL); }
@@ -916,8 +934,8 @@ fn sys_list_block_devices(buf: u64, len: u64) -> u64 {
     for registered in crate::block::devices() {
         let device = registered.device;
         let info = crate::fs_probe::inspect(device);
-        let mountpoint = if registered.name == "ram0" { "/disk" } else { "" };
-        write_lsblk_row(&mut output, registered.name, &info, mountpoint, "");
+        let mountpoint = crate::vfs::mountpoint_for_device(registered.name).unwrap_or_default();
+        write_lsblk_row(&mut output, registered.name, &info, &mountpoint, "");
         if let Ok(parts) = crate::partition::scan(device) {
             for (i, part) in parts.iter().enumerate() {
                 let view = crate::block::PartitionDevice::new(device, part.start_lba, part.sectors);
@@ -1031,6 +1049,7 @@ fn fs_errno(error: crate::vfs::FsError) -> u64 {
         F::ReadOnly => EROFS,
         F::NoSpace => ENOSPC,
         F::InvalidName | F::InvalidPath => EINVAL,
+        F::Io => EIO,
         F::NotFound => ENOENT,
         F::NotDirectory => ENOTDIR,
         F::IsDirectory => EISDIR,
@@ -1059,6 +1078,8 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
         SYS_MKDIR => frame.rax = sys_path_mutation(frame.rdi, frame.rsi, true),
         SYS_REMOVE => frame.rax = sys_path_mutation(frame.rdi, frame.rsi, false),
         SYS_SYNC => frame.rax = sys_sync(),
+        SYS_MOUNT => frame.rax = sys_mount(frame.rdi, frame.rsi),
+        SYS_PANIC => panic!("kernel panic requested by process {}", scheduler::current_id()),
         SYS_READ_FILE => frame.rax = sys_read_file(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         SYS_UPTIME_MS => frame.rax = pit::uptime_ms(),
         SYS_SLEEP_MS => { scheduler::sleep_ms(frame.rdi); frame.rax = 0; }
